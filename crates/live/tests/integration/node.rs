@@ -6461,6 +6461,7 @@ mod test_add_exec_client {
         account_id: AccountId,
         venue: Venue,
         should_fail_connect: Rc<RefCell<bool>>,
+        mass_status: Rc<RefCell<Option<ExecutionMassStatus>>>,
     }
 
     impl SimpleTestClient {
@@ -6470,11 +6471,18 @@ mod test_add_exec_client {
                 account_id,
                 venue,
                 should_fail_connect: Rc::new(RefCell::new(false)),
+                mass_status: Rc::new(RefCell::new(None)),
             }
         }
 
         fn with_fail_connect(self) -> Self {
             *self.should_fail_connect.borrow_mut() = true;
+            self
+        }
+
+        #[allow(dead_code)]
+        fn with_mass_status(self, status: ExecutionMassStatus) -> Self {
+            *self.mass_status.borrow_mut() = Some(status);
             self
         }
     }
@@ -6580,7 +6588,7 @@ mod test_add_exec_client {
             &self,
             _lookback_mins: Option<u64>,
         ) -> anyhow::Result<Option<ExecutionMassStatus>> {
-            Ok(None)
+            Ok(self.mass_status.borrow().clone())
         }
 
         fn on_instrument(&mut self, _instrument: InstrumentAny) {}
@@ -6654,6 +6662,34 @@ mod test_add_exec_client {
 
         assert!(result.is_ok(), "add_exec_client_live should succeed");
 
+        let cache = node.kernel().cache.clone();
+        let account_a_id = AccountId::from("ACCOUNT-A");
+
+        // Verify both clients registered
+        let engine = node.kernel().exec_engine.borrow();
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-B")).is_some(),
+            "CLIENT-B should be registered"
+        );
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
+            "CLIENT-A should still be registered"
+        );
+        drop(engine);
+
+        // Verify reconciliation didn't leak B's data into A
+        let a_order_count = cache
+            .borrow()
+            .orders_open(None, None, None, Some(&account_a_id), None)
+            .len();
+
+        // Verify no cross-account data pollution by checking that adding B
+        // doesn't introduce orders for A that weren't there before
+        assert_eq!(
+            0, a_order_count,
+            "ACCOUNT-A should not have orders (no pollution from ACCOUNT-B)"
+        );
+
         let engine = node.kernel().exec_engine.borrow();
         assert!(
             engine.get_client(&ClientId::from("CLIENT-B")).is_some(),
@@ -6701,27 +6737,46 @@ mod test_add_exec_client {
             .register_venue_routing(ClientId::from("CLIENT-A"), Venue::from("SIM"))
             .expect("should set venue routing");
 
-        // Snapshot client counts before adding B
-        let clients_before = node
-            .kernel()
-            .exec_engine
+        // Snapshot A's cache state before adding B
+        let cache = node.kernel().cache.clone();
+        let account_a_id = AccountId::from("ACCOUNT-A");
+        let orders_count_before = cache
             .borrow()
-            .client_ids();
+            .orders_open(None, None, None, Some(&account_a_id), None)
+            .len();
+        let positions_count_before = cache
+            .borrow()
+            .positions_open(None, None, None, Some(&account_a_id), None)
+            .len();
+        let accounts_count_before = cache.borrow().accounts(&account_a_id).len();
 
         let live_client_b = LiveExecutionClient::new(Box::new(client_b));
 
         let _ = node.add_exec_client_live(live_client_b).await;
 
-        let clients_after = node
-            .kernel()
-            .exec_engine
+        // Assert A's cache state is unchanged after adding B
+        let orders_count_after = cache
             .borrow()
-            .client_ids();
+            .orders_open(None, None, None, Some(&account_a_id), None)
+            .len();
+        let positions_count_after = cache
+            .borrow()
+            .positions_open(None, None, None, Some(&account_a_id), None)
+            .len();
+        let accounts_count_after = cache.borrow().accounts(&account_a_id).len();
 
-        // Should have one more client
-        assert_eq!(clients_after.len(), clients_before.len() + 1);
-        // Client A should still be there
-        assert!(clients_after.contains(&ClientId::from("CLIENT-A")));
+        assert_eq!(
+            orders_count_before, orders_count_after,
+            "ACCOUNT-A's orders should be identical before and after adding B"
+        );
+        assert_eq!(
+            positions_count_before, positions_count_after,
+            "ACCOUNT-A's positions should be identical before and after adding B"
+        );
+        assert_eq!(
+            accounts_count_before, accounts_count_after,
+            "ACCOUNT-A's account refs should be identical before and after adding B"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6853,5 +6908,6 @@ mod test_add_exec_client {
             clients_after.contains(&ClientId::from("CLIENT-A")),
             "CLIENT-A should still be registered"
         );
+
     }
 }

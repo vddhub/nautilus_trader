@@ -675,6 +675,8 @@ impl LiveNode {
             if let Err(e) = engine.register_venue_routing(client_id, venue) {
                 // Rollback on routing failure
                 let _ = engine.deregister_client(client_id);
+                drop(engine);
+                self.exec_manager.deregister_submission_retention(client_id);
                 return Err(e);
             }
         }
@@ -690,7 +692,11 @@ impl LiveNode {
             if let Err(e) = engine.connect_client(client_id).await {
                 // Rollback on connect failure
                 let _ = engine.deregister_client(client_id);
-                self.exec_clients.pop();
+                drop(engine);
+                self.exec_manager.deregister_submission_retention(client_id);
+                if let Some(pos) = self.exec_clients.iter().position(|c| c.client_id() == client_id) {
+                    self.exec_clients.remove(pos);
+                }
                 return Err(e);
             }
         }
@@ -782,7 +788,10 @@ impl LiveNode {
                     let mut engine = self.kernel.exec_engine.borrow_mut();
                     let _ = engine.deregister_client(client_id);
                 }
-                self.exec_clients.pop();
+                self.exec_manager.deregister_submission_retention(client_id);
+                if let Some(pos) = self.exec_clients.iter().position(|c| c.client_id() == client_id) {
+                    self.exec_clients.remove(pos);
+                }
                 return Err(e).context(format!("Failed to get mass status from {client_id}"));
             }
         }

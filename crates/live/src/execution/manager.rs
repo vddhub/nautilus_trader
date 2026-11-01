@@ -1975,6 +1975,15 @@ impl ExecutionManager {
         }
     }
 
+    pub(crate) fn deregister_submission_retention(&mut self, client_id: ClientId) {
+        self.submission_retention.shift_remove(&client_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submission_retention_contains(&self, client_id: ClientId) -> bool {
+        self.submission_retention.contains_key(&client_id)
+    }
+
     fn submission_retention_enabled(
         &self,
         client_order_id: ClientOrderId,
