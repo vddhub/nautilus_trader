@@ -7316,27 +7316,100 @@ mod test_remove_exec_client {
         }
     }
 
+mod test_lifecycle_commands {
+    use nautilus_live::execution::client::LiveExecutionClient;
+    use super::test_remove_exec_client::SimpleTestClient;
+
     #[tokio::test(flavor = "current_thread")]
-    async fn test_lifecycle_command_channel_exists() {
+    async fn test_lifecycle_command_add_then_remove_exec_client() {
         use nautilus_live::command::ExecClientCommand;
 
         let _bus = MessageBus::new(TraderId::from("TESTER-009"), UUID4::new(), None, None)
             .register_message_bus();
 
-        // This test verifies that the lifecycle command channel is properly wired
-        // and that commands can be sent through it without error
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecutionEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            delay_post_stop: Duration::from_millis(50),
+            ..Default::default()
+        };
 
-        let runner = AsyncRunner::default();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("TestNode")
+            .build()
+            .unwrap();
 
-        // Test that the lifecycle_cmd_sender can be accessed
-        let lifecycle_cmd_tx = runner.get_lifecycle_cmd_sender();
+        let client_b = SimpleTestClient::new(
+            ClientId::from("CLIENT-B"),
+            AccountId::from("ACCOUNT-B"),
+            Venue::from("BINANCE"),
+        );
 
-        // Create a dummy command and verify it can be sent
-        // (We don't have a receiver here to actually receive it, but we can verify
-        // the channel exists and is operational)
-        let client_id = ClientId::from("TEST-CLIENT");
-        let result = lifecycle_cmd_tx.send(ExecClientCommand::Remove(client_id));
+        // Get the lifecycle command sender from the node's runner
+        let lifecycle_cmd_tx = node
+            .get_lifecycle_cmd_sender()
+            .expect("lifecycle_cmd_sender should be available");
 
-        assert!(result.is_ok(), "Should be able to send Remove command through lifecycle channel");
+        // Clone the exec_engine handle so we can query it after commands run
+        let exec_engine = node.kernel().exec_engine.clone();
+
+        // Get the node handle to control shutdown
+        let handle = node.handle();
+        let state_handle = handle.clone();
+
+        // Spawn the node's event loop on the runtime
+        tokio::spawn(async move {
+            // Wait for the node to reach Running state
+            wait_until_async(
+                || async { state_handle.is_running() },
+                Duration::from_secs(5),
+            )
+            .await;
+
+            // Send Add command for CLIENT-B
+            lifecycle_cmd_tx
+                .send(ExecClientCommand::Add(Box::new(
+                    LiveExecutionClient::new(Box::new(client_b)),
+                )))
+                .expect("should send Add command");
+
+            // Allow the event loop to process the command
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Verify CLIENT-B is now present
+            let engine = exec_engine.borrow();
+            assert!(
+                engine.get_client(&ClientId::from("CLIENT-B")).is_some(),
+                "CLIENT-B should be registered after Add command"
+            );
+            drop(engine);
+
+            // Send Remove command for CLIENT-B
+            lifecycle_cmd_tx
+                .send(ExecClientCommand::Remove(ClientId::from("CLIENT-B")))
+                .expect("should send Remove command");
+
+            // Allow the event loop to process the command
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Verify CLIENT-B is now absent
+            let engine = exec_engine.borrow();
+            assert!(
+                engine.get_client(&ClientId::from("CLIENT-B")).is_none(),
+                "CLIENT-B should be unregistered after Remove command"
+            );
+            drop(engine);
+
+            // Stop the node
+            state_handle.stop();
+        });
+
+        // Run the node's event loop
+        let result = node.run().await;
+        assert!(result.is_ok(), "node should run successfully");
+        assert_eq!(handle.state(), NodeState::Stopped);
     }
 }
