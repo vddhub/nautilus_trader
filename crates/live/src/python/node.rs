@@ -56,7 +56,7 @@ use nautilus_core::{
 };
 use nautilus_model::{
     enums::OmsType,
-    identifiers::{ActorId, ExecAlgorithmId, InstrumentId, StrategyId, TraderId},
+    identifiers::{ActorId, ClientId, ExecAlgorithmId, InstrumentId, StrategyId, TraderId},
 };
 use nautilus_portfolio::{config::PortfolioConfig, python::PyPortfolio};
 use nautilus_system::get_global_pyo3_registry;
@@ -91,10 +91,12 @@ use super::client::{PythonClientConfig, PythonClients, PythonDataFactory, Python
 pub use crate::node::NodeState;
 use crate::{
     builder::LiveNodeBuilder,
+    command::ExecClientCommand,
     config::{
         LiveDataEngineConfig, LiveExecutionEngineConfig, LiveNodeConfig, LiveRiskEngineConfig,
         PluginConfig,
     },
+    execution::LiveExecutionClient,
     node::{LiveNode, LiveNodeHandle, NodeRunMode, config::RoutingConfig},
     python::config::{coerce_json_config, json_value_to_py},
 };
@@ -2608,6 +2610,111 @@ impl PyLiveNodeBuilder {
             operation.complete(updated_builder);
             Ok(self.shared())
         })
+    }
+
+    /// Adds an execution client to a running node via the lifecycle command channel.
+    ///
+    /// Builds a client from the factory and config using the same pattern as the builder,
+    /// then enqueues it for registration through the running node's event loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The node is not running.
+    /// - The factory extraction or client creation fails.
+    /// - Sending the lifecycle command fails.
+    #[pyo3(name = "py_add_exec_client_live", signature = (factory, config, routing=None))]
+    fn py_add_exec_client_live(
+        &self,
+        factory: Py<PyAny>,
+        config: Py<PyAny>,
+        routing: Option<RoutingConfig>,
+    ) -> PyResult<()> {
+        if !self.handle.is_running() {
+            return Err(to_pyruntime_err(
+                "Node is not running; add clients to a running node",
+            ));
+        }
+
+        Python::attach(|py| -> PyResult<()> {
+            let registry = get_global_pyo3_registry();
+            let node = self.node()?;
+
+            // Extract factory and config using the same pattern as the builder
+            let boxed_factory = registry.extract_exec_factory(py, factory.clone_ref(py))?;
+            let boxed_config = registry.extract_config(py, config.clone_ref(py))?;
+
+            // Get the factory name for the client ID
+            let factory_name = factory
+                .getattr(py, "name")?
+                .call0(py)?
+                .extract::<String>(py)?;
+            let client_id = ClientId::new(factory_name);
+
+            // Extract trader_id, cache, and clock from the running node's kernel
+            let trader_id = node.trader_id();
+            let cache = node.kernel().cache().clone();
+            let clock = node.kernel().clock();
+
+            // Create the client using the factory, mirroring the builder pattern
+            let boxed_client = boxed_factory
+                .create(trader_id, &client_id.to_string(), boxed_config, cache, clock)
+                .map_err(|e| to_pyruntime_err(format!("Failed to create execution client: {e}")))?;
+
+            let client = LiveExecutionClient::new(boxed_client);
+
+            // Enqueue Add command through the lifecycle channel
+            let lifecycle_tx = node
+                .get_lifecycle_cmd_sender()
+                .map_err(|e| to_pyruntime_err(format!("Failed to get lifecycle sender: {e}")))?;
+
+            lifecycle_tx
+                .send(ExecClientCommand::Add(Box::new(client)))
+                .map_err(|e| {
+                    to_pyruntime_err(format!(
+                        "Failed to enqueue exec client add command: {e}"
+                    ))
+                })?;
+
+            Ok(())
+        })
+    }
+
+    /// Removes an execution client from a running node via the lifecycle command channel.
+    ///
+    /// Enqueues a removal command for the specified client ID, which the running node's
+    /// event loop will process to unregister the client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The node is not running.
+    /// - The client ID is invalid.
+    /// - Sending the lifecycle command fails.
+    #[pyo3(name = "py_remove_exec_client")]
+    fn py_remove_exec_client(&self, client_id: &str) -> PyResult<()> {
+        if !self.handle.is_running() {
+            return Err(to_pyruntime_err(
+                "Node is not running; remove clients from a running node",
+            ));
+        }
+
+        let node = self.node()?;
+        let client_id = ClientId::new(client_id);
+
+        let lifecycle_tx = node
+            .get_lifecycle_cmd_sender()
+            .map_err(|e| to_pyruntime_err(format!("Failed to get lifecycle sender: {e}")))?;
+
+        lifecycle_tx
+            .send(ExecClientCommand::Remove(client_id))
+            .map_err(|e| {
+                to_pyruntime_err(format!(
+                    "Failed to enqueue exec client remove command: {e}"
+                ))
+            })?;
+
+        Ok(())
     }
 
     #[pyo3(name = "build")]
