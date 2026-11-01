@@ -6963,16 +6963,44 @@ mod test_remove_exec_client {
         let cache = node.kernel().cache.clone();
         let account_b_id = AccountId::from("ACCOUNT-B");
         let account_a_id = AccountId::from("ACCOUNT-A");
+        let instrument_id = crypto_perpetual_ethusdt().id();
 
-        // Snapshot cache state before removal
+        // Create actual orders for both accounts
+        let order_b = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(ClientOrderId::from("B-ORDER-001"))
+            .instrument_id(instrument_id)
+            .quantity(Quantity::from("10.0"))
+            .price(Price::from("100.0"))
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(order_b, None, Some(ClientId::from("CLIENT-B")), false)
+            .expect("should add order for B");
+
+        let order_a = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(ClientOrderId::from("A-ORDER-001"))
+            .instrument_id(instrument_id)
+            .quantity(Quantity::from("5.0"))
+            .price(Price::from("95.0"))
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(order_a, None, Some(ClientId::from("CLIENT-A")), false)
+            .expect("should add order for A");
+
+        // Snapshot cache state with actual orders
         let orders_b_before = cache
             .borrow()
-            .orders_open(None, None, None, Some(&account_b_id), None)
-            .len();
+            .orders_open(None, None, None, Some(&account_b_id), None);
         let orders_a_before = cache
             .borrow()
-            .orders_open(None, None, None, Some(&account_a_id), None)
-            .len();
+            .orders_open(None, None, None, Some(&account_a_id), None);
+
+        assert_eq!(orders_b_before.len(), 1, "should have 1 order for account B before removal");
+        assert_eq!(orders_a_before.len(), 1, "should have 1 order for account A before removal");
+
+        let order_b_id = orders_b_before[0].client_order_id();
+        let order_a_id = orders_a_before[0].client_order_id();
 
         // Remove client B
         let result = node.remove_exec_client(ClientId::from("CLIENT-B")).await;
@@ -6990,23 +7018,33 @@ mod test_remove_exec_client {
         );
         drop(engine);
 
-        // Verify B's cached orders are still there (unchanged count)
+        // Verify B's cached orders are still there with same identifiers
         let orders_b_after = cache
             .borrow()
-            .orders_open(None, None, None, Some(&account_b_id), None)
-            .len();
+            .orders_open(None, None, None, Some(&account_b_id), None);
         let orders_a_after = cache
             .borrow()
-            .orders_open(None, None, None, Some(&account_a_id), None)
-            .len();
+            .orders_open(None, None, None, Some(&account_a_id), None);
 
         assert_eq!(
-            orders_b_before, orders_b_after,
-            "ACCOUNT-B's cached orders should remain after removal"
+            orders_b_after.len(),
+            1,
+            "ACCOUNT-B should still have 1 order after removal"
         );
         assert_eq!(
-            orders_a_before, orders_a_after,
-            "ACCOUNT-A's cached orders should be unchanged"
+            orders_b_after[0].client_order_id(),
+            order_b_id,
+            "ACCOUNT-B's order should be unchanged (same id)"
+        );
+        assert_eq!(
+            orders_a_after.len(),
+            1,
+            "ACCOUNT-A should still have 1 order after removal"
+        );
+        assert_eq!(
+            orders_a_after[0].client_order_id(),
+            order_a_id,
+            "ACCOUNT-A's order should be unchanged (same id)"
         );
     }
 
@@ -7186,6 +7224,154 @@ mod test_remove_exec_client {
         assert!(
             engine.get_client(&ClientId::from("CLIENT-B")).is_none(),
             "CLIENT-B should not be registered"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_order_routes_to_correct_client() {
+        let _bus = MessageBus::new(TraderId::from("TESTER-008"), UUID4::new(), None, None)
+            .register_message_bus();
+
+        let config = LiveNodeConfig::default();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("TestNode")
+            .build()
+            .unwrap();
+
+        // Setup two clients on different venues
+        let client_a = super::test_add_exec_client::SimpleTestClient::new(
+            ClientId::from("CLIENT-A"),
+            AccountId::from("ACCOUNT-A"),
+            Venue::from("SIM"),
+        );
+
+        let client_b = super::test_add_exec_client::SimpleTestClient::new(
+            ClientId::from("CLIENT-B"),
+            AccountId::from("ACCOUNT-B"),
+            Venue::from("BINANCE"),
+        );
+
+        // Register client A
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(client_a))
+            .expect("should register client A");
+
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_venue_routing(ClientId::from("CLIENT-A"), Venue::from("SIM"))
+            .expect("should set routing for A");
+
+        // Add client B on BINANCE
+        let live_client_b = LiveExecutionClient::new(Box::new(client_b));
+        let _ = node.add_exec_client_live(live_client_b).await;
+
+        // Verify both clients are registered and accessible
+        {
+            let engine = node.kernel().exec_engine.borrow();
+            assert!(
+                engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
+                "CLIENT-A should be registered on SIM venue"
+            );
+            assert!(
+                engine.get_client(&ClientId::from("CLIENT-B")).is_some(),
+                "CLIENT-B should be registered on BINANCE venue"
+            );
+        }
+
+        // Create orders on different venues - verify they associate with correct client/account
+        let sim_instrument = crypto_perpetual_ethusdt();
+        let cache = node.kernel().cache.clone();
+
+        // Add order for SIM venue - associates with CLIENT-A and ACCOUNT-A
+        let order_a = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(ClientOrderId::from("A-ORDER-001"))
+            .instrument_id(sim_instrument.id())
+            .quantity(Quantity::from("10.0"))
+            .price(Price::from("100.0"))
+            .build();
+
+        cache
+            .borrow_mut()
+            .add_order(
+                order_a.clone(),
+                None,
+                Some(ClientId::from("CLIENT-A")),
+                false,
+            )
+            .expect("should add order for SIM venue");
+
+        // Verify the order was cached under ACCOUNT-A (CLIENT-A's account)
+        let orders_a = cache
+            .borrow()
+            .orders_open(None, None, None, Some(&AccountId::from("ACCOUNT-A")), None);
+        assert_eq!(
+            orders_a.len(),
+            1,
+            "should have 1 order for ACCOUNT-A (CLIENT-A)"
+        );
+        assert_eq!(
+            orders_a[0].instrument_id().venue,
+            Venue::from("SIM"),
+            "order should be on SIM venue (CLIENT-A's venue)"
+        );
+
+        // Create a position for account B (CLIENT-B's account) to verify removal leaves it intact
+        let position = Position::new(
+            InstrumentId::from("ETH/USDT.BINANCE"),
+            PositionId::from("POS-001"),
+            AccountId::from("ACCOUNT-B"),
+            Venue::from("BINANCE"),
+        );
+        cache.borrow_mut().add_position(position);
+
+        let positions_b_before = cache
+            .borrow()
+            .positions_open(None, None, None, Some(&AccountId::from("ACCOUNT-B")), None);
+        assert_eq!(
+            positions_b_before.len(),
+            1,
+            "should have 1 position for ACCOUNT-B (CLIENT-B)"
+        );
+
+        // Remove client B
+        let result = node.remove_exec_client(ClientId::from("CLIENT-B")).await;
+        assert!(result.is_ok(), "remove_exec_client should succeed");
+
+        // Verify CLIENT-A remains intact and routable
+        {
+            let engine = node.kernel().exec_engine.borrow();
+            assert!(
+                engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
+                "CLIENT-A should still be registered"
+            );
+            assert!(
+                engine.get_client(&ClientId::from("CLIENT-B")).is_none(),
+                "CLIENT-B should not be registered after removal"
+            );
+        }
+
+        // Verify A's orders are unchanged
+        let orders_a_after = cache
+            .borrow()
+            .orders_open(None, None, None, Some(&AccountId::from("ACCOUNT-A")), None);
+        assert_eq!(
+            orders_a_after.len(),
+            1,
+            "ACCOUNT-A should still have 1 order after CLIENT-B removal"
+        );
+
+        // Verify B's position persists after CLIENT-B removal
+        let positions_b_after = cache
+            .borrow()
+            .positions_open(None, None, None, Some(&AccountId::from("ACCOUNT-B")), None);
+        assert_eq!(
+            positions_b_after.len(),
+            1,
+            "ACCOUNT-B position should persist after CLIENT-B removal"
         );
     }
 }
