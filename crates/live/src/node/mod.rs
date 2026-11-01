@@ -319,6 +319,8 @@ impl LiveNode {
             exec_manager_config,
         )?;
 
+        let lifecycle_cmd_tx = Some(runner.get_lifecycle_cmd_sender());
+
         let node = Self {
             kernel,
             runner: Some(runner),
@@ -331,6 +333,7 @@ impl LiveNode {
             external_msgbus: None,
             stream_processors: Vec::new(),
             shutdown_deadline: None,
+            lifecycle_cmd_tx,
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
             _thread_owner: thread_owner,

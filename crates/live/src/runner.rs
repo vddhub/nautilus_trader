@@ -227,7 +227,6 @@ pub(crate) enum PendingRunnerEvent {
     ExecCommand(DispatchMessage<TradingCommandMessage>),
     DataEvent(DispatchMessage<DataEvent>),
     DataCommand(DispatchMessage<DataCommand>),
-    LifecycleCommand(crate::command::ExecClientCommand),
 }
 
 pub struct AsyncRunner {

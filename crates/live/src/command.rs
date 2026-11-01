@@ -19,7 +19,7 @@ use std::fmt::Debug;
 
 use nautilus_model::identifiers::ClientId;
 
-use crate::execution::LiveExecutionClient;
+use crate::execution::client::LiveExecutionClient;
 
 /// Commands for execution client lifecycle management routed through the live node's event loop.
 #[derive(Clone)]
