@@ -96,7 +96,7 @@ use crate::{
         LiveDataEngineConfig, LiveExecutionEngineConfig, LiveNodeConfig, LiveRiskEngineConfig,
         PluginConfig,
     },
-    execution::LiveExecutionClient,
+    execution::client::LiveExecutionClient,
     node::{LiveNode, LiveNodeHandle, NodeRunMode, config::RoutingConfig},
     python::config::{coerce_json_config, json_value_to_py},
 };
@@ -1568,6 +1568,101 @@ impl PyLiveNode {
             self.py_is_running()
         )
     }
+
+    /// Adds an execution client to a running node via the lifecycle command channel.
+    ///
+    /// Builds a client from the factory and config using the same pattern as the builder,
+    /// then enqueues it for registration through the running node's event loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The node is not running.
+    /// - The factory extraction or client creation fails.
+    /// - A client for the same venue is already registered.
+    /// - Sending the lifecycle command fails.
+    #[pyo3(name = "py_add_exec_client_live", signature = (factory, config))]
+    fn py_add_exec_client_live(
+        &self,
+        factory: Py<PyAny>,
+        config: Py<PyAny>,
+    ) -> PyResult<()> {
+        if !self.handle.is_running() {
+            return Err(to_pyruntime_err(
+                "Node is not running; add clients to a running node",
+            ));
+        }
+
+        Python::attach(|py| -> PyResult<()> {
+            let registry = get_global_pyo3_registry();
+            let node = self.node()?;
+
+            // Extract factory and config using the same pattern as the builder
+            let boxed_factory = registry.extract_exec_factory(py, factory.clone_ref(py))?;
+            let boxed_config = registry.extract_config(py, config.clone_ref(py))?;
+
+            // Get the factory name for the client ID
+            let factory_name = factory
+                .getattr(py, "name")?
+                .call0(py)?
+                .extract::<String>(py)?;
+            let client_id = ClientId::new(factory_name);
+
+            // Extract trader_id, cache, and clock from the running node's kernel
+            let trader_id = node.trader_id();
+            let clock = node.kernel().clock();
+
+            // Create the client using the factory, mirroring the builder pattern
+            let boxed_client = boxed_factory
+                .create(trader_id, &client_id.to_string(), &*boxed_config, node.kernel().cache().clone().into(), clock)
+                .map_err(|e| to_pyruntime_err(format!("Failed to create execution client: {e}")))?;
+
+            let client = LiveExecutionClient::new(boxed_client);
+
+            // Get the lifecycle sender
+            let lifecycle_tx = node
+                .get_lifecycle_cmd_sender()
+                .ok_or_else(|| to_pyruntime_err("Failed to get lifecycle sender: node has not been run yet"))?;
+
+            // Enqueue Add command and await reply
+            Self::send_lifecycle_command_and_await(py, &lifecycle_tx, |reply_tx| {
+                ExecClientCommand::Add(Box::new(client), reply_tx)
+            })
+        })
+    }
+
+    /// Removes an execution client from a running node via the lifecycle command channel.
+    ///
+    /// Enqueues a removal command for the specified client ID, which the running node's
+    /// event loop will process to unregister the client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The node is not running.
+    /// - The client ID is invalid.
+    /// - Sending the lifecycle command fails.
+    #[pyo3(name = "py_remove_exec_client")]
+    fn py_remove_exec_client(&self, client_id: &str) -> PyResult<()> {
+        if !self.handle.is_running() {
+            return Err(to_pyruntime_err(
+                "Node is not running; remove clients from a running node",
+            ));
+        }
+
+        Python::attach(|py| -> PyResult<()> {
+            let node = self.node()?;
+            let client_id = ClientId::new(client_id);
+
+            let lifecycle_tx = node
+                .get_lifecycle_cmd_sender()
+                .ok_or_else(|| to_pyruntime_err("Failed to get lifecycle sender: node has not been run yet"))?;
+
+            Self::send_lifecycle_command_and_await(py, &lifecycle_tx, |reply_tx| {
+                ExecClientCommand::Remove(client_id, reply_tx)
+            })
+        })
+    }
 }
 
 impl LiveNode {
@@ -1771,6 +1866,31 @@ impl LiveNode {
 }
 
 impl PyLiveNode {
+    fn send_lifecycle_command_and_await<F>(
+        py: Python<'_>,
+        sender: &tokio::sync::mpsc::UnboundedSender<ExecClientCommand>,
+        make_cmd: F,
+    ) -> PyResult<()>
+    where
+        F: FnOnce(tokio::sync::oneshot::Sender<crate::command::LifecycleCommandResponse>) -> ExecClientCommand,
+    {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        sender.send(make_cmd(reply_tx)).map_err(|e| {
+            to_pyruntime_err(format!(
+                "Failed to enqueue exec client command: {e}"
+            ))
+        })?;
+
+        let result = py.detach(|| {
+            reply_rx.blocking_recv()
+                .map_err(|_| "Event loop dropped reply channel".to_string())
+                .and_then(|r| r)
+        });
+
+        result.map_err(|e| to_pyruntime_err(e))?;
+        Ok(())
+    }
+
     fn register_python_actor(&self, actor: &Py<PyAny>, actor_id: ActorId) -> PyResult<()> {
         if self
             .node()?
@@ -2609,128 +2729,6 @@ impl PyLiveNodeBuilder {
 
             operation.complete(updated_builder);
             Ok(self.shared())
-        })
-    }
-
-    fn send_lifecycle_command_and_await<F>(
-        py: Python<'_>,
-        sender: &mpsc::UnboundedSender<ExecClientCommand>,
-        make_cmd: F,
-    ) -> PyResult<()>
-    where
-        F: FnOnce(tokio::sync::oneshot::Sender<crate::command::LifecycleCommandResponse>) -> ExecClientCommand,
-    {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        sender.send(make_cmd(reply_tx)).map_err(|e| {
-            to_pyruntime_err(format!(
-                "Failed to enqueue exec client command: {e}"
-            ))
-        })?;
-
-        let result = py.allow_threads(|| {
-            reply_rx.blocking_recv()
-                .map_err(|_| "Event loop dropped reply channel".to_string())
-                .and_then(|r| r)
-        });
-
-        result.map_err(|e| to_pyruntime_err(e))?;
-        Ok(())
-    }
-
-    /// Adds an execution client to a running node via the lifecycle command channel.
-    ///
-    /// Builds a client from the factory and config using the same pattern as the builder,
-    /// then enqueues it for registration through the running node's event loop.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The node is not running.
-    /// - The factory extraction or client creation fails.
-    /// - A client for the same venue is already registered.
-    /// - Sending the lifecycle command fails.
-    #[pyo3(name = "py_add_exec_client_live", signature = (factory, config, routing=None))]
-    fn py_add_exec_client_live(
-        &self,
-        factory: Py<PyAny>,
-        config: Py<PyAny>,
-        routing: Option<RoutingConfig>,
-    ) -> PyResult<()> {
-        if !self.handle.is_running() {
-            return Err(to_pyruntime_err(
-                "Node is not running; add clients to a running node",
-            ));
-        }
-
-        Python::attach(|py| -> PyResult<()> {
-            let registry = get_global_pyo3_registry();
-            let node = self.node()?;
-
-            // Extract factory and config using the same pattern as the builder
-            let boxed_factory = registry.extract_exec_factory(py, factory.clone_ref(py))?;
-            let boxed_config = registry.extract_config(py, config.clone_ref(py))?;
-
-            // Get the factory name for the client ID
-            let factory_name = factory
-                .getattr(py, "name")?
-                .call0(py)?
-                .extract::<String>(py)?;
-            let client_id = ClientId::new(factory_name);
-
-            // Extract trader_id, cache, and clock from the running node's kernel
-            let trader_id = node.trader_id();
-            let cache = node.kernel().cache().clone();
-            let clock = node.kernel().clock();
-
-            // Create the client using the factory, mirroring the builder pattern
-            let boxed_client = boxed_factory
-                .create(trader_id, &client_id.to_string(), boxed_config, cache.clone(), clock)
-                .map_err(|e| to_pyruntime_err(format!("Failed to create execution client: {e}")))?;
-
-            let client = LiveExecutionClient::new(boxed_client);
-
-            // Get the lifecycle sender
-            let lifecycle_tx = node
-                .get_lifecycle_cmd_sender()
-                .map_err(|e| to_pyruntime_err(format!("Failed to get lifecycle sender: {e}")))?;
-
-            // Enqueue Add command and await reply
-            Self::send_lifecycle_command_and_await(py, &lifecycle_tx, |reply_tx| {
-                ExecClientCommand::Add(Box::new(client), reply_tx)
-            })
-        })
-    }
-
-    /// Removes an execution client from a running node via the lifecycle command channel.
-    ///
-    /// Enqueues a removal command for the specified client ID, which the running node's
-    /// event loop will process to unregister the client.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The node is not running.
-    /// - The client ID is invalid.
-    /// - Sending the lifecycle command fails.
-    #[pyo3(name = "py_remove_exec_client")]
-    fn py_remove_exec_client(&self, client_id: &str) -> PyResult<()> {
-        if !self.handle.is_running() {
-            return Err(to_pyruntime_err(
-                "Node is not running; remove clients from a running node",
-            ));
-        }
-
-        Python::attach(|py| -> PyResult<()> {
-            let node = self.node()?;
-            let client_id = ClientId::new(client_id);
-
-            let lifecycle_tx = node
-                .get_lifecycle_cmd_sender()
-                .map_err(|e| to_pyruntime_err(format!("Failed to get lifecycle sender: {e}")))?;
-
-            Self::send_lifecycle_command_and_await(py, &lifecycle_tx, |reply_tx| {
-                ExecClientCommand::Remove(client_id, reply_tx)
-            })
         })
     }
 
