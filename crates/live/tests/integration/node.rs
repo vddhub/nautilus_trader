@@ -6456,7 +6456,7 @@ mod test_add_exec_client {
     use std::rc::Rc;
 
     #[derive(Clone)]
-    struct SimpleTestClient {
+    pub(super) struct SimpleTestClient {
         client_id: ClientId,
         account_id: AccountId,
         venue: Venue,
@@ -6465,7 +6465,7 @@ mod test_add_exec_client {
     }
 
     impl SimpleTestClient {
-        fn new(client_id: ClientId, account_id: AccountId, venue: Venue) -> Self {
+        pub(super) fn new(client_id: ClientId, account_id: AccountId, venue: Venue) -> Self {
             Self {
                 client_id,
                 account_id,
@@ -6909,5 +6909,283 @@ mod test_add_exec_client {
             "CLIENT-A should still be registered"
         );
 
+    }
+}
+
+// Tests for LiveNode::remove_exec_client
+mod test_remove_exec_client {
+    use super::*;
+    use nautilus_common::msgbus::MessageBus;
+    use nautilus_live::execution::client::LiveExecutionClient;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_remove_exec_client_leaves_orders_and_positions() {
+        let _bus = MessageBus::new(TraderId::from("TESTER-004"), UUID4::new(), None, None)
+            .register_message_bus();
+
+        let config = LiveNodeConfig::default();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("TestNode")
+            .build()
+            .unwrap();
+
+        // Setup two clients
+        let client_a = super::test_add_exec_client::SimpleTestClient::new(
+            ClientId::from("CLIENT-A"),
+            AccountId::from("ACCOUNT-A"),
+            Venue::from("SIM"),
+        );
+
+        let client_b = super::test_add_exec_client::SimpleTestClient::new(
+            ClientId::from("CLIENT-B"),
+            AccountId::from("ACCOUNT-B"),
+            Venue::from("BINANCE"),
+        );
+
+        // Register and setup client A
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(client_a.clone()))
+            .expect("should register client A");
+
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_venue_routing(ClientId::from("CLIENT-A"), Venue::from("SIM"))
+            .expect("should set routing for A");
+
+        // Add client B
+        let live_client_b = LiveExecutionClient::new(Box::new(client_b));
+        let _ = node.add_exec_client_live(live_client_b).await;
+
+        let cache = node.kernel().cache.clone();
+        let account_b_id = AccountId::from("ACCOUNT-B");
+        let account_a_id = AccountId::from("ACCOUNT-A");
+
+        // Snapshot cache state before removal
+        let orders_b_before = cache
+            .borrow()
+            .orders_open(None, None, None, Some(&account_b_id), None)
+            .len();
+        let orders_a_before = cache
+            .borrow()
+            .orders_open(None, None, None, Some(&account_a_id), None)
+            .len();
+
+        // Remove client B
+        let result = node.remove_exec_client(ClientId::from("CLIENT-B")).await;
+        assert!(result.is_ok(), "remove_exec_client should succeed");
+
+        // Verify client B is deregistered from engine
+        let engine = node.kernel().exec_engine.borrow();
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-B")).is_none(),
+            "CLIENT-B should not be registered"
+        );
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
+            "CLIENT-A should still be registered"
+        );
+        drop(engine);
+
+        // Verify B's cached orders are still there (unchanged count)
+        let orders_b_after = cache
+            .borrow()
+            .orders_open(None, None, None, Some(&account_b_id), None)
+            .len();
+        let orders_a_after = cache
+            .borrow()
+            .orders_open(None, None, None, Some(&account_a_id), None)
+            .len();
+
+        assert_eq!(
+            orders_b_before, orders_b_after,
+            "ACCOUNT-B's cached orders should remain after removal"
+        );
+        assert_eq!(
+            orders_a_before, orders_a_after,
+            "ACCOUNT-A's cached orders should be unchanged"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_remove_exec_client_frees_venue_and_routing() {
+        let _bus = MessageBus::new(TraderId::from("TESTER-005"), UUID4::new(), None, None)
+            .register_message_bus();
+
+        let config = LiveNodeConfig::default();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("TestNode")
+            .build()
+            .unwrap();
+
+        let client_b = super::test_add_exec_client::SimpleTestClient::new(
+            ClientId::from("CLIENT-B"),
+            AccountId::from("ACCOUNT-B"),
+            Venue::from("BINANCE"),
+        );
+
+        // Add client B
+        let live_client_b = LiveExecutionClient::new(Box::new(client_b));
+        let _ = node.add_exec_client_live(live_client_b).await;
+
+        // Verify B is registered
+        {
+            let engine = node.kernel().exec_engine.borrow();
+            assert!(
+                engine.get_client(&ClientId::from("CLIENT-B")).is_some(),
+                "CLIENT-B should be registered"
+            );
+        }
+
+        // Remove client B
+        let result = node.remove_exec_client(ClientId::from("CLIENT-B")).await;
+        assert!(result.is_ok(), "remove_exec_client should succeed");
+
+        // Verify client B is deregistered
+        {
+            let engine = node.kernel().exec_engine.borrow();
+            assert!(
+                engine.get_client(&ClientId::from("CLIENT-B")).is_none(),
+                "CLIENT-B should not be registered after removal"
+            );
+        }
+
+        // Now add a new client on the same venue - should succeed
+        let client_b2 = super::test_add_exec_client::SimpleTestClient::new(
+            ClientId::from("CLIENT-B2"),
+            AccountId::from("ACCOUNT-B2"),
+            Venue::from("BINANCE"),
+        );
+
+        let live_client_b2 = LiveExecutionClient::new(Box::new(client_b2));
+        let result = node.add_exec_client_live(live_client_b2).await;
+
+        assert!(
+            result.is_ok(),
+            "Should be able to add new client on BINANCE after removing old one"
+        );
+
+        let engine = node.kernel().exec_engine.borrow();
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-B2")).is_some(),
+            "CLIENT-B2 should be registered"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_remove_unknown_client_errors() {
+        let _bus = MessageBus::new(TraderId::from("TESTER-006"), UUID4::new(), None, None)
+            .register_message_bus();
+
+        let config = LiveNodeConfig::default();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("TestNode")
+            .build()
+            .unwrap();
+
+        let client_a = super::test_add_exec_client::SimpleTestClient::new(
+            ClientId::from("CLIENT-A"),
+            AccountId::from("ACCOUNT-A"),
+            Venue::from("SIM"),
+        );
+
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(client_a))
+            .expect("should register client A");
+
+        // Try to remove unknown client
+        let result = node
+            .remove_exec_client(ClientId::from("CLIENT-UNKNOWN"))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "remove_exec_client should error for unknown client"
+        );
+
+        // Verify client A is still registered
+        let engine = node.kernel().exec_engine.borrow();
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
+            "CLIENT-A should still be registered after failed removal"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_remove_exec_client_with_two_registered_clients() {
+        let _bus = MessageBus::new(TraderId::from("TESTER-007"), UUID4::new(), None, None)
+            .register_message_bus();
+
+        let config = LiveNodeConfig::default();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("TestNode")
+            .build()
+            .unwrap();
+
+        // Setup two clients on different venues
+        let client_a = super::test_add_exec_client::SimpleTestClient::new(
+            ClientId::from("CLIENT-A"),
+            AccountId::from("ACCOUNT-A"),
+            Venue::from("SIM"),
+        );
+
+        let client_b = super::test_add_exec_client::SimpleTestClient::new(
+            ClientId::from("CLIENT-B"),
+            AccountId::from("ACCOUNT-B"),
+            Venue::from("BINANCE"),
+        );
+
+        // Register client A
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(client_a))
+            .expect("should register client A");
+
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_venue_routing(ClientId::from("CLIENT-A"), Venue::from("SIM"))
+            .expect("should set routing for A");
+
+        // Add client B
+        let live_client_b = LiveExecutionClient::new(Box::new(client_b));
+        let _ = node.add_exec_client_live(live_client_b).await;
+
+        // Both clients should be registered
+        {
+            let engine = node.kernel().exec_engine.borrow();
+            assert!(
+                engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
+                "CLIENT-A should be registered"
+            );
+            assert!(
+                engine.get_client(&ClientId::from("CLIENT-B")).is_some(),
+                "CLIENT-B should be registered"
+            );
+        }
+
+        // Remove client B
+        let result = node.remove_exec_client(ClientId::from("CLIENT-B")).await;
+        assert!(result.is_ok(), "remove_exec_client should succeed");
+
+        // Only A should remain registered
+        let engine = node.kernel().exec_engine.borrow();
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
+            "CLIENT-A should still be registered"
+        );
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-B")).is_none(),
+            "CLIENT-B should not be registered"
+        );
     }
 }

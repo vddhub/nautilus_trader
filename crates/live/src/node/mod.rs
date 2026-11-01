@@ -116,7 +116,7 @@ use nautilus_core::{
 use nautilus_model::reports::OrderStatusReport;
 use nautilus_model::{
     events::OrderEventAny,
-    identifiers::{ClientOrderId, InstrumentId, StrategyId, TraderId},
+    identifiers::{ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId},
     orders::Order,
 };
 use nautilus_network::mode::ReconnectRequestOutcome;
@@ -794,6 +794,49 @@ impl LiveNode {
                 }
                 return Err(e).context(format!("Failed to get mass status from {client_id}"));
             }
+        }
+
+        Ok(())
+    }
+
+    /// Remove an execution client from the running node.
+    ///
+    /// Disconnects the client, stops its report tasks, deregisters it from the engine,
+    /// and removes it from the node's client list. The client's cached orders and positions
+    /// are left intact (not cancelled or flattened).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client_id is not registered.
+    pub async fn remove_exec_client(&mut self, client_id: ClientId) -> anyhow::Result<()> {
+        // Check if client exists
+        {
+            let engine = self.kernel.exec_engine.borrow();
+            if engine.get_client(&client_id).is_none() {
+                anyhow::bail!("No execution client registered with ID {client_id}");
+            }
+        }
+
+        // Find and disconnect the LiveExecutionClient
+        if let Some(pos) = self.exec_clients.iter().position(|c| c.client_id() == client_id) {
+            let client = &mut self.exec_clients[pos];
+            if let Err(e) = client.disconnect().await {
+                log::warn!("Error disconnecting client {client_id}: {e}");
+            }
+        }
+
+        // Stop report tasks
+        self.exec_manager.deregister_submission_retention(client_id);
+
+        // Deregister from engine
+        {
+            let mut engine = self.kernel.exec_engine.borrow_mut();
+            engine.deregister_client(client_id)?;
+        }
+
+        // Remove from exec_clients list
+        if let Some(pos) = self.exec_clients.iter().position(|c| c.client_id() == client_id) {
+            self.exec_clients.remove(pos);
         }
 
         Ok(())
