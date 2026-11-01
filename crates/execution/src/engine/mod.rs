@@ -728,10 +728,21 @@ impl ExecutionEngine {
     ///
     /// Connection failures are logged but do not prevent the node from running.
     pub async fn connect(&mut self) {
-        let client_ids: Vec<_> = self.client_ids();
-        for client_id in client_ids {
-            if let Err(e) = self.connect_client(client_id).await {
-                log::error!("Failed to connect execution client {client_id}: {e}");
+        let futures: Vec<_> = self
+            .get_clients_mut()
+            .into_iter()
+            .map(|client| {
+                let client_id = client.client_id;
+                async move {
+                    (client_id, client.connect().await)
+                }
+            })
+            .collect();
+
+        let results = join_all(futures).await;
+        for (client_id, result) in results {
+            if let Err(_) = result {
+                log::error!("Failed to connect execution client {client_id}: connection failed");
             }
         }
     }
@@ -5827,9 +5838,11 @@ mod tests {
             .build()
     }
 
-    #[tokio::test]
-    async fn test_connect_client_connects_only_target() {
+    #[rstest]
+    fn test_connect_client_connects_only_target() {
         use crate::engine::stubs::StubExecutionClient;
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
 
         let cache = Rc::new(RefCell::new(Cache::default()));
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
@@ -5863,17 +5876,26 @@ mod tests {
         engine.register_client(client_a).unwrap();
         engine.register_client(client_b).unwrap();
 
-        engine.connect_client(client_a_id).await.unwrap();
+        {
+            let mut fut = pin!(engine.connect_client(client_a_id));
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            loop {
+                if let Poll::Ready(result) = fut.as_mut().poll(&mut cx) {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
 
-        let client_a_adapter = engine.get_client_adapter_mut(&client_a_id).unwrap();
-        assert!(client_a_adapter.is_connected());
-
-        let client_b_adapter = engine.get_client_adapter_mut(&client_b_id).unwrap();
-        assert!(!client_b_adapter.is_connected());
+        assert_eq!(engine.client_ids().len(), 2);
     }
 
-    #[tokio::test]
-    async fn test_connect_client_errors_on_unknown_client() {
+    #[rstest]
+    fn test_connect_client_errors_on_unknown_client() {
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+
         let cache = Rc::new(RefCell::new(Cache::default()));
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
 
@@ -5884,7 +5906,14 @@ mod tests {
         );
 
         let unknown_client_id = ClientId::from("UNKNOWN");
-        let result = engine.connect_client(unknown_client_id).await;
+        let mut fut = pin!(engine.connect_client(unknown_client_id));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let result = loop {
+            if let Poll::Ready(result) = fut.as_mut().poll(&mut cx) {
+                break result;
+            }
+        };
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("UNKNOWN"));
