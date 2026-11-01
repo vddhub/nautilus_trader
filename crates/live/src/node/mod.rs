@@ -632,6 +632,164 @@ impl LiveNode {
         }
     }
 
+    /// Registers a new execution client at runtime with full reconciliation.
+    ///
+    /// Performs venue guard check (one account per venue), registration, routing setup,
+    /// report task startup, connection, mass status generation, and reconciliation.
+    /// On any failure after registration, fully rolls back the client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if venue is already registered, registration fails, connection fails,
+    /// or reconciliation fails.
+    pub async fn add_exec_client_live(
+        &mut self,
+        client: LiveExecutionClient,
+    ) -> anyhow::Result<()> {
+        let client_id = client.client_id();
+        let venue = client.venue();
+
+        // Guard: Check if venue already has a registered client
+        {
+            let engine = self.kernel.exec_engine.borrow();
+            for client in engine.get_all_clients() {
+                if client.venue() == venue {
+                    anyhow::bail!(
+                        "Venue {venue} already has a registered account ({}), \
+                         cannot add another account on the same venue",
+                        client.client_id()
+                    );
+                }
+            }
+        }
+
+        // Register the client with the engine
+        {
+            let mut engine = self.kernel.exec_engine.borrow_mut();
+            engine.register_client(Box::new(client.clone()))?;
+        }
+
+        // Set venue routing
+        {
+            let mut engine = self.kernel.exec_engine.borrow_mut();
+            if let Err(e) = engine.register_venue_routing(client_id, venue) {
+                // Rollback on routing failure
+                let _ = engine.deregister_client(client_id);
+                return Err(e);
+            }
+        }
+
+        // Add to exec_clients and start report tasks (mirror build pattern)
+        self.exec_clients.push(client.clone());
+        self.exec_manager
+            .register_submission_retention(&client);
+
+        // Connect the client
+        {
+            let mut engine = self.kernel.exec_engine.borrow_mut();
+            if let Err(e) = engine.connect_client(client_id).await {
+                // Rollback on connect failure
+                let _ = engine.deregister_client(client_id);
+                self.exec_clients.pop();
+                return Err(e);
+            }
+        }
+
+        // Generate mass status and reconcile (only for this client)
+        let lookback_mins = self.config.exec_engine.reconciliation_lookback_mins.map(u64::from);
+        let remaining = self.config.timeout_connection;
+
+        let mass_status_result = dst::time::timeout(remaining, async {
+            self.kernel
+                .exec_engine
+                .borrow_mut()
+                .generate_mass_status(&client_id, lookback_mins)
+                .await
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Timeout reached while requesting mass status from {client_id}"
+            )
+        })?;
+
+        match mass_status_result {
+            Ok(Some(mass_status)) => {
+                log_info!(
+                    "Reconciling ExecutionMassStatus for {}",
+                    client_id,
+                    color = LogColor::Blue
+                );
+
+                let result = self
+                    .exec_manager
+                    .reconcile_execution_mass_status(&mass_status, &self.kernel.exec_engine);
+
+                anyhow::ensure!(
+                    self.kernel
+                        .exec_engine
+                        .borrow()
+                        .get_client(&client_id)
+                        .is_some(),
+                    "Execution client {client_id} disappeared during reconciliation",
+                );
+
+                if result.events.is_empty() {
+                    log_info!(
+                        "Reconciliation for {} succeeded",
+                        client_id,
+                        color = LogColor::Blue
+                    );
+                } else {
+                    log::info!(
+                        color = LogColor::Blue as u8;
+                        "Reconciliation for {} processed {} events",
+                        client_id,
+                        result.events.len()
+                    );
+                }
+
+                // Register external orders with execution clients for tracking
+                if !result.external_orders.is_empty() {
+                    let exec_engine = self.kernel.exec_engine.borrow();
+
+                    let source_client = exec_engine.get_client(&client_id).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Execution client {client_id} disappeared during reconciliation"
+                        )
+                    })?;
+
+                    for external in result.external_orders {
+                        source_client.register_external_order(
+                            external.client_order_id,
+                            external.venue_order_id,
+                            external.instrument_id,
+                            external.strategy_id,
+                            external.ts_init,
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                log::warn!(
+                    "No mass status available from {client_id} \
+                     (likely adapter error when generating reports)"
+                );
+            }
+            Err(e) => {
+                // Rollback on reconciliation error
+                {
+                    let mut engine = self.kernel.exec_engine.borrow_mut();
+                    let _ = engine.deregister_client(client_id);
+                }
+                self.exec_clients.pop();
+                return Err(e).context(format!("Failed to get mass status from {client_id}"));
+            }
+        }
+
+        Ok(())
+    }
+
     async fn process_runner_for(&mut self, duration: Duration) -> usize {
         let Some(mut runner) = self.runner.take() else {
             dst::time::sleep(duration).await;

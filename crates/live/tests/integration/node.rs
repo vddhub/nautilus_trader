@@ -6445,3 +6445,413 @@ pub(crate) mod serial_tests {
         assert_eq!(handle.state(), NodeState::Stopped, "seed={SEED:#x}");
     }
 }
+
+// Tests for LiveNode::add_exec_client_live
+mod test_add_exec_client {
+    use super::*;
+    use nautilus_common::msgbus::MessageBus;
+    use nautilus_live::execution::client::LiveExecutionClient;
+    use indexmap::IndexMap;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Clone)]
+    struct SimpleTestClient {
+        client_id: ClientId,
+        account_id: AccountId,
+        venue: Venue,
+        should_fail_connect: Rc<RefCell<bool>>,
+    }
+
+    impl SimpleTestClient {
+        fn new(client_id: ClientId, account_id: AccountId, venue: Venue) -> Self {
+            Self {
+                client_id,
+                account_id,
+                venue,
+                should_fail_connect: Rc::new(RefCell::new(false)),
+            }
+        }
+
+        fn with_fail_connect(self) -> Self {
+            *self.should_fail_connect.borrow_mut() = true;
+            self
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl ExecutionClient for SimpleTestClient {
+        fn venue_order_ids(
+            &self,
+            _mass_status: &ExecutionMassStatus,
+        ) -> Option<IndexMap<ClientOrderId, Vec<VenueOrderId>>> {
+            None
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn client_id(&self) -> ClientId {
+            self.client_id
+        }
+
+        fn account_id(&self) -> AccountId {
+            self.account_id
+        }
+
+        fn venue(&self) -> Venue {
+            self.venue
+        }
+
+        fn oms_type(&self) -> OmsType {
+            OmsType::Netting
+        }
+
+        fn get_account(&self) -> Option<AccountAny> {
+            None
+        }
+
+        fn start(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn generate_order_status_report_task(
+            &self,
+            _cmd: &GenerateOrderStatusReport,
+        ) -> Option<ExecutionReportTask<Option<OrderStatusReport>>> {
+            None
+        }
+
+        fn generate_order_status_reports_task(
+            &self,
+            _cmd: &GenerateOrderStatusReports,
+        ) -> Option<ExecutionReportTask<Vec<OrderStatusReport>>> {
+            None
+        }
+
+        fn generate_fill_reports_task(
+            &self,
+            _cmd: &GenerateFillReports,
+        ) -> Option<ExecutionReportTask<Vec<FillReport>>> {
+            None
+        }
+
+        fn generate_position_status_reports_task(
+            &self,
+            _cmd: &GeneratePositionStatusReports,
+        ) -> Option<ExecutionReportTask<Vec<PositionStatusReport>>> {
+            None
+        }
+
+        async fn generate_order_status_report(
+            &self,
+            _cmd: &GenerateOrderStatusReport,
+        ) -> anyhow::Result<Option<OrderStatusReport>> {
+            Ok(None)
+        }
+
+        async fn generate_order_status_reports(
+            &self,
+            _cmd: &GenerateOrderStatusReports,
+        ) -> anyhow::Result<Vec<OrderStatusReport>> {
+            Ok(Vec::new())
+        }
+
+        async fn generate_fill_reports(
+            &self,
+            _cmd: GenerateFillReports,
+        ) -> anyhow::Result<Vec<FillReport>> {
+            Ok(Vec::new())
+        }
+
+        async fn generate_position_status_reports(
+            &self,
+            _cmd: &GeneratePositionStatusReports,
+        ) -> anyhow::Result<Vec<PositionStatusReport>> {
+            Ok(Vec::new())
+        }
+
+        async fn generate_mass_status(
+            &self,
+            _lookback_mins: Option<u64>,
+        ) -> anyhow::Result<Option<ExecutionMassStatus>> {
+            Ok(None)
+        }
+
+        fn on_instrument(&mut self, _instrument: InstrumentAny) {}
+
+        fn calculate_commission(
+            &self,
+            _instrument: &InstrumentAny,
+            _last_qty: Quantity,
+            _last_px: Price,
+            _liquidity_side: LiquiditySide,
+        ) -> anyhow::Result<Option<Money>> {
+            Ok(None)
+        }
+
+        async fn connect(&mut self) -> anyhow::Result<()> {
+            if *self.should_fail_connect.borrow() {
+                anyhow::bail!("Connect failed")
+            }
+            Ok(())
+        }
+
+        async fn disconnect(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn generate_account_state(
+            &self,
+            _balances: Vec<AccountBalance>,
+            _margins: Vec<::nautilus_model::types::MarginBalance>,
+            _is_reported: bool,
+            _ts_event: UnixNanos,
+            _params: Option<Params>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_add_exec_client_reconciles_only_new_account() {
+        let _bus = MessageBus::new(TraderId::from("TESTER-001"), UUID4::new(), None, None)
+            .register_message_bus();
+
+        let config = LiveNodeConfig::default();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("TestNode")
+            .build()
+            .unwrap();
+
+        let client_a = SimpleTestClient::new(
+            ClientId::from("CLIENT-A"),
+            AccountId::from("ACCOUNT-A"),
+            Venue::from("SIM"),
+        );
+
+        let client_b = SimpleTestClient::new(
+            ClientId::from("CLIENT-B"),
+            AccountId::from("ACCOUNT-B"),
+            Venue::from("BINANCE"),
+        );
+
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(client_a))
+            .expect("should register client A");
+
+        let live_client_b = LiveExecutionClient::new(Box::new(client_b));
+
+        let result = node.add_exec_client_live(live_client_b).await;
+
+        assert!(result.is_ok(), "add_exec_client_live should succeed");
+
+        let engine = node.kernel().exec_engine.borrow();
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-B")).is_some(),
+            "CLIENT-B should be registered"
+        );
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
+            "CLIENT-A should still be registered"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_add_exec_client_leaves_sibling_untouched() {
+        let _bus = MessageBus::new(TraderId::from("TESTER-002"), UUID4::new(), None, None)
+            .register_message_bus();
+
+        let config = LiveNodeConfig::default();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("TestNode")
+            .build()
+            .unwrap();
+
+        let client_a = SimpleTestClient::new(
+            ClientId::from("CLIENT-A"),
+            AccountId::from("ACCOUNT-A"),
+            Venue::from("SIM"),
+        );
+
+        let client_b = SimpleTestClient::new(
+            ClientId::from("CLIENT-B"),
+            AccountId::from("ACCOUNT-B"),
+            Venue::from("BINANCE"),
+        );
+
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(client_a.clone()))
+            .expect("should register client A");
+
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_venue_routing(ClientId::from("CLIENT-A"), Venue::from("SIM"))
+            .expect("should set venue routing");
+
+        // Snapshot client counts before adding B
+        let clients_before = node
+            .kernel()
+            .exec_engine
+            .borrow()
+            .client_ids();
+
+        let live_client_b = LiveExecutionClient::new(Box::new(client_b));
+
+        let _ = node.add_exec_client_live(live_client_b).await;
+
+        let clients_after = node
+            .kernel()
+            .exec_engine
+            .borrow()
+            .client_ids();
+
+        // Should have one more client
+        assert_eq!(clients_after.len(), clients_before.len() + 1);
+        // Client A should still be there
+        assert!(clients_after.contains(&ClientId::from("CLIENT-A")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_add_exec_client_rejects_duplicate_venue() {
+        let _bus = MessageBus::new(TraderId::from("TESTER-003"), UUID4::new(), None, None)
+            .register_message_bus();
+
+        let config = LiveNodeConfig::default();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("TestNode")
+            .build()
+            .unwrap();
+
+        let client_a = SimpleTestClient::new(
+            ClientId::from("CLIENT-A"),
+            AccountId::from("ACCOUNT-A"),
+            Venue::from("BINANCE"),
+        );
+
+        let client_b = SimpleTestClient::new(
+            ClientId::from("CLIENT-B"),
+            AccountId::from("ACCOUNT-B"),
+            Venue::from("BINANCE"),
+        );
+
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(client_a))
+            .expect("should register client A");
+
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_venue_routing(ClientId::from("CLIENT-A"), Venue::from("BINANCE"))
+            .expect("should set venue routing");
+
+        let live_client_b = LiveExecutionClient::new(Box::new(client_b));
+
+        let result = node.add_exec_client_live(live_client_b).await;
+
+        assert!(
+            result.is_err(),
+            "add_exec_client_live should reject duplicate venue"
+        );
+
+        let engine = node.kernel().exec_engine.borrow();
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-B")).is_none(),
+            "CLIENT-B should not be registered"
+        );
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
+            "CLIENT-A should still be registered"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_add_exec_client_rolls_back_on_connect_failure() {
+        let _bus = MessageBus::new(TraderId::from("TESTER-004"), UUID4::new(), None, None)
+            .register_message_bus();
+
+        let config = LiveNodeConfig::default();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("TestNode")
+            .build()
+            .unwrap();
+
+        let client_a = SimpleTestClient::new(
+            ClientId::from("CLIENT-A"),
+            AccountId::from("ACCOUNT-A"),
+            Venue::from("SIM"),
+        );
+
+        let client_b = SimpleTestClient::new(
+            ClientId::from("CLIENT-B"),
+            AccountId::from("ACCOUNT-B"),
+            Venue::from("BINANCE"),
+        )
+        .with_fail_connect();
+
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(client_a))
+            .expect("should register client A");
+
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_venue_routing(ClientId::from("CLIENT-A"), Venue::from("SIM"))
+            .expect("should set venue routing");
+
+        let clients_before = node
+            .kernel()
+            .exec_engine
+            .borrow()
+            .client_ids();
+
+        let live_client_b = LiveExecutionClient::new(Box::new(client_b));
+
+        let result = node.add_exec_client_live(live_client_b).await;
+
+        assert!(
+            result.is_err(),
+            "add_exec_client_live should fail when connect fails"
+        );
+
+        let engine = node.kernel().exec_engine.borrow();
+        let clients_after = engine.client_ids();
+
+        // Client count should be unchanged
+        assert_eq!(
+            clients_before.len(),
+            clients_after.len(),
+            "Client list should be rolled back"
+        );
+
+        // CLIENT-B should not be present
+        assert!(
+            !clients_after.contains(&ClientId::from("CLIENT-B")),
+            "CLIENT-B should not be registered after rollback"
+        );
+
+        // CLIENT-A should still be there
+        assert!(
+            clients_after.contains(&ClientId::from("CLIENT-A")),
+            "CLIENT-A should still be registered"
+        );
+    }
+}

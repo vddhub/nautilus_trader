@@ -69,7 +69,7 @@ use rust_decimal::Decimal;
 use crate::task::{TaskJoinOutcome, TaskSlot};
 
 #[derive(Clone)]
-pub(crate) struct LiveExecutionClient {
+pub struct LiveExecutionClient {
     client: Rc<RefCell<Box<dyn ExecutionClient>>>,
     pending_instruments: Rc<RefCell<VecDeque<InstrumentAny>>>,
     report_task: Rc<RefCell<TaskSlot<()>>>,
@@ -92,7 +92,7 @@ impl Debug for LiveExecutionClient {
 }
 
 impl LiveExecutionClient {
-    pub(crate) fn new(client: Box<dyn ExecutionClient>) -> Self {
+    pub fn new(client: Box<dyn ExecutionClient>) -> Self {
         let client_id = client.client_id();
         let account_id = client.account_id();
         let venue = client.venue();

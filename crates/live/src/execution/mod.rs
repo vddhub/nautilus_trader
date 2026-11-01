@@ -31,5 +31,4 @@ pub mod submission;
 mod recency;
 mod reconciliation;
 
-#[cfg(feature = "node")]
-pub(crate) mod client;
+pub mod client;
