@@ -711,24 +711,27 @@ impl ExecutionEngine {
         }
     }
 
+    /// Connects a single registered execution client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no client is registered with the given ID.
+    pub async fn connect_client(&mut self, client_id: ClientId) -> anyhow::Result<()> {
+        if let Some(client) = self.clients.get_mut(&client_id) {
+            client.connect().await
+        } else {
+            anyhow::bail!("No client registered with ID {client_id}")
+        }
+    }
+
     /// Connects all registered execution clients concurrently.
     ///
     /// Connection failures are logged but do not prevent the node from running.
     pub async fn connect(&mut self) {
-        let futures: Vec<_> = self
-            .get_clients_mut()
-            .into_iter()
-            .map(|client| async move {
-                let client_id = client.client_id;
-                (client_id, client.connect().await)
-            })
-            .collect();
-
-        let results = join_all(futures).await;
-
-        for (client_id, result) in results {
-            if result.is_err() {
-                log::error!("Failed to connect execution client {client_id}: connection failed");
+        let client_ids: Vec<_> = self.client_ids();
+        for client_id in client_ids {
+            if let Err(e) = self.connect_client(client_id).await {
+                log::error!("Failed to connect execution client {client_id}: {e}");
             }
         }
     }
@@ -5822,5 +5825,68 @@ mod tests {
             .currency(fill.currency)
             .liquidity_side(fill.liquidity_side)
             .build()
+    }
+
+    #[tokio::test]
+    async fn test_connect_client_connects_only_target() {
+        use crate::engine::stubs::StubExecutionClient;
+
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+
+        let mut engine = ExecutionEngine::new(
+            clock.clone(),
+            cache.clone(),
+            None,
+        );
+
+        let client_a_id = ClientId::from("A");
+        let client_b_id = ClientId::from("B");
+        let account_id = AccountId::from("SIM-001");
+        let venue = Venue::from("SIM");
+
+        let client_a = Box::new(StubExecutionClient::new(
+            client_a_id,
+            account_id,
+            venue,
+            nautilus_model::enums::OmsType::Netting,
+            Some(clock.clone()),
+        ));
+        let client_b = Box::new(StubExecutionClient::new(
+            client_b_id,
+            account_id,
+            venue,
+            nautilus_model::enums::OmsType::Netting,
+            Some(clock.clone()),
+        ));
+
+        engine.register_client(client_a).unwrap();
+        engine.register_client(client_b).unwrap();
+
+        engine.connect_client(client_a_id).await.unwrap();
+
+        let client_a_adapter = engine.get_client_adapter_mut(&client_a_id).unwrap();
+        assert!(client_a_adapter.is_connected());
+
+        let client_b_adapter = engine.get_client_adapter_mut(&client_b_id).unwrap();
+        assert!(!client_b_adapter.is_connected());
+    }
+
+    #[tokio::test]
+    async fn test_connect_client_errors_on_unknown_client() {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+
+        let mut engine = ExecutionEngine::new(
+            clock,
+            cache,
+            None,
+        );
+
+        let unknown_client_id = ClientId::from("UNKNOWN");
+        let result = engine.connect_client(unknown_client_id).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("UNKNOWN"));
     }
 }
