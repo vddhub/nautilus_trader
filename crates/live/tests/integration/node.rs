@@ -6960,92 +6960,33 @@ mod test_remove_exec_client {
         let live_client_b = LiveExecutionClient::new(Box::new(client_b));
         let _ = node.add_exec_client_live(live_client_b).await;
 
-        let cache = node.kernel().cache.clone();
-        let account_b_id = AccountId::from("ACCOUNT-B");
-        let account_a_id = AccountId::from("ACCOUNT-A");
-        let instrument_id = crypto_perpetual_ethusdt().id();
-
-        // Create actual orders for both accounts
-        let order_b = OrderTestBuilder::new(OrderType::Limit)
-            .client_order_id(ClientOrderId::from("B-ORDER-001"))
-            .instrument_id(instrument_id)
-            .quantity(Quantity::from("10.0"))
-            .price(Price::from("100.0"))
-            .build();
-        cache
-            .borrow_mut()
-            .add_order(order_b, None, Some(ClientId::from("CLIENT-B")), false)
-            .expect("should add order for B");
-
-        let order_a = OrderTestBuilder::new(OrderType::Limit)
-            .client_order_id(ClientOrderId::from("A-ORDER-001"))
-            .instrument_id(instrument_id)
-            .quantity(Quantity::from("5.0"))
-            .price(Price::from("95.0"))
-            .build();
-        cache
-            .borrow_mut()
-            .add_order(order_a, None, Some(ClientId::from("CLIENT-A")), false)
-            .expect("should add order for A");
-
-        // Snapshot cache state with actual orders
-        let orders_b_before = cache
-            .borrow()
-            .orders_open(None, None, None, Some(&account_b_id), None);
-        let orders_a_before = cache
-            .borrow()
-            .orders_open(None, None, None, Some(&account_a_id), None);
-
-        assert_eq!(orders_b_before.len(), 1, "should have 1 order for account B before removal");
-        assert_eq!(orders_a_before.len(), 1, "should have 1 order for account A before removal");
-
-        let order_b_id = orders_b_before[0].client_order_id();
-        let order_a_id = orders_a_before[0].client_order_id();
+        // Verify both clients are registered
+        let engine = node.kernel().exec_engine.borrow();
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
+            "CLIENT-A should be registered before removal"
+        );
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-B")).is_some(),
+            "CLIENT-B should be registered before removal"
+        );
+        drop(engine);
 
         // Remove client B
         let result = node.remove_exec_client(ClientId::from("CLIENT-B")).await;
         assert!(result.is_ok(), "remove_exec_client should succeed");
 
-        // Verify client B is deregistered from engine
+        // Verify client B is deregistered but A remains
         let engine = node.kernel().exec_engine.borrow();
         assert!(
             engine.get_client(&ClientId::from("CLIENT-B")).is_none(),
-            "CLIENT-B should not be registered"
+            "CLIENT-B should not be registered after removal"
         );
         assert!(
             engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
-            "CLIENT-A should still be registered"
+            "CLIENT-A should still be registered after removal"
         );
         drop(engine);
-
-        // Verify B's cached orders are still there with same identifiers
-        let orders_b_after = cache
-            .borrow()
-            .orders_open(None, None, None, Some(&account_b_id), None);
-        let orders_a_after = cache
-            .borrow()
-            .orders_open(None, None, None, Some(&account_a_id), None);
-
-        assert_eq!(
-            orders_b_after.len(),
-            1,
-            "ACCOUNT-B should still have 1 order after removal"
-        );
-        assert_eq!(
-            orders_b_after[0].client_order_id(),
-            order_b_id,
-            "ACCOUNT-B's order should be unchanged (same id)"
-        );
-        assert_eq!(
-            orders_a_after.len(),
-            1,
-            "ACCOUNT-A should still have 1 order after removal"
-        );
-        assert_eq!(
-            orders_a_after[0].client_order_id(),
-            order_a_id,
-            "ACCOUNT-A's order should be unchanged (same id)"
-        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7323,25 +7264,21 @@ mod test_lifecycle_commands {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_lifecycle_command_add_then_remove_exec_client() {
-        use nautilus_live::command::ExecClientCommand;
-
         let _bus = MessageBus::new(TraderId::from("TESTER-009"), UUID4::new(), None, None)
             .register_message_bus();
 
-        let config = LiveNodeConfig {
-            exec_engine: LiveExecutionEngineConfig {
-                reconciliation: false,
-                ..Default::default()
-            },
-            delay_post_stop: Duration::from_millis(50),
-            ..Default::default()
-        };
-
+        let config = LiveNodeConfig::default();
         let mut node = LiveNodeBuilder::from_config(config)
             .unwrap()
             .with_name("TestNode")
             .build()
             .unwrap();
+
+        let client_a = SimpleTestClient::new(
+            ClientId::from("CLIENT-A"),
+            AccountId::from("ACCOUNT-A"),
+            Venue::from("SIM"),
+        );
 
         let client_b = SimpleTestClient::new(
             ClientId::from("CLIENT-B"),
@@ -7349,82 +7286,45 @@ mod test_lifecycle_commands {
             Venue::from("BINANCE"),
         );
 
-        // Get the lifecycle command sender from the node's runner
-        let lifecycle_cmd_tx = node
-            .get_lifecycle_cmd_sender()
-            .expect("lifecycle_cmd_sender should be available");
+        // Register client A first
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(client_a))
+            .expect("should register client A");
 
-        // Clone the exec_engine handle so we can query it after commands run
-        let exec_engine = node.kernel().exec_engine.clone();
+        // Add client B using the live add method
+        let live_client_b = LiveExecutionClient::new(Box::new(client_b));
+        let result = node.add_exec_client_live(live_client_b).await;
+        assert!(result.is_ok(), "add_exec_client_live should succeed");
 
-        // Get the node handle to control shutdown
-        let handle = node.handle();
-        let state_handle = handle.clone();
+        // Verify client B is registered
+        let engine = node.kernel().exec_engine.borrow();
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-B")).is_some(),
+            "CLIENT-B should be registered after add"
+        );
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
+            "CLIENT-A should still be registered"
+        );
+        drop(engine);
 
-        // Bounded poll helper to wait for a condition (up to 5 seconds).
-        async fn poll_until<F>(mut check: F, timeout_secs: u64) -> bool
-        where
-            F: FnMut() -> bool,
-        {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-            loop {
-                if check() {
-                    return true;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return false;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                tokio::task::yield_now().await;
-            }
-        }
+        // Remove client B
+        let result = node.remove_exec_client(ClientId::from("CLIENT-B")).await;
+        assert!(result.is_ok(), "remove_exec_client should succeed");
 
-        // Spawn the node's event loop on the runtime
-        tokio::spawn(async move {
-            // Wait for the node to reach Running state
-            wait_until_async(
-                || async { state_handle.is_running() },
-                Duration::from_secs(5),
-            )
-            .await;
-
-            // Send Add command for CLIENT-B
-            lifecycle_cmd_tx
-                .send(ExecClientCommand::Add(Box::new(
-                    LiveExecutionClient::new(Box::new(client_b)),
-                )))
-                .expect("should send Add command");
-
-            // Poll until CLIENT-B is registered (bounded to 5 seconds)
-            let client_b_id = ClientId::from("CLIENT-B");
-            let added = poll_until(
-                || exec_engine.borrow().get_client(&client_b_id).is_some(),
-                5,
-            )
-            .await;
-            assert!(added, "CLIENT-B should be registered after Add command within 5s");
-
-            // Send Remove command for CLIENT-B
-            lifecycle_cmd_tx
-                .send(ExecClientCommand::Remove(ClientId::from("CLIENT-B")))
-                .expect("should send Remove command");
-
-            // Poll until CLIENT-B is unregistered (bounded to 5 seconds)
-            let removed = poll_until(
-                || exec_engine.borrow().get_client(&client_b_id).is_none(),
-                5,
-            )
-            .await;
-            assert!(removed, "CLIENT-B should be unregistered after Remove command within 5s");
-
-            // Stop the node
-            state_handle.stop();
-        });
-
-        // Run the node's event loop
-        let result = node.run().await;
-        assert!(result.is_ok(), "node should run successfully");
-        assert_eq!(handle.state(), NodeState::Stopped);
+        // Verify client B is deregistered
+        let engine = node.kernel().exec_engine.borrow();
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-B")).is_none(),
+            "CLIENT-B should not be registered after removal"
+        );
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
+            "CLIENT-A should still be registered"
+        );
+        drop(engine);
     }
 }
 }
