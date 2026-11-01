@@ -411,12 +411,6 @@ impl Cache {
         self.client_routes.insert(venue, client_id);
     }
 
-    /// Returns the execution client ID routed for the given venue, if any.
-    #[must_use]
-    pub fn client_id_for_venue(&self, venue: &Venue) -> Option<ClientId> {
-        self.client_routes.get(venue).copied()
-    }
-
     /// Registers the execution client `client_id` as the default route for venues without a
     /// route, replacing any previous default.
     pub fn set_default_client(&mut self, client_id: ClientId) {

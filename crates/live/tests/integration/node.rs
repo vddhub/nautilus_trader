@@ -7287,7 +7287,7 @@ mod test_remove_exec_client {
 
         // Verify routing: SIM venue should be routed to CLIENT-A
         {
-            let routed_client = cache.borrow().client_id_for_venue(&Venue::from("SIM"));
+            let routed_client = cache.borrow().client_id_for_venue(&Venue::from("SIM")).copied();
             assert_eq!(
                 routed_client,
                 Some(ClientId::from("CLIENT-A")),
@@ -7297,7 +7297,7 @@ mod test_remove_exec_client {
 
         // Verify routing: BINANCE venue should be routed to CLIENT-B
         {
-            let routed_client = cache.borrow().client_id_for_venue(&Venue::from("BINANCE"));
+            let routed_client = cache.borrow().client_id_for_venue(&Venue::from("BINANCE")).copied();
             assert_eq!(
                 routed_client,
                 Some(ClientId::from("CLIENT-B")),
@@ -7307,8 +7307,8 @@ mod test_remove_exec_client {
 
         // Verify routing distinguishes venues: they must route to different clients
         {
-            let sim_route = cache.borrow().client_id_for_venue(&Venue::from("SIM"));
-            let binance_route = cache.borrow().client_id_for_venue(&Venue::from("BINANCE"));
+            let sim_route = cache.borrow().client_id_for_venue(&Venue::from("SIM")).copied();
+            let binance_route = cache.borrow().client_id_for_venue(&Venue::from("BINANCE")).copied();
             assert_ne!(
                 sim_route, binance_route,
                 "SIM and BINANCE venues must route to different clients"
