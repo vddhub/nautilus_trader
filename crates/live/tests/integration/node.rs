@@ -7317,8 +7317,9 @@ mod test_remove_exec_client {
     }
 
 mod test_lifecycle_commands {
+    use super::*;
     use nautilus_live::execution::client::LiveExecutionClient;
-    use super::test_remove_exec_client::SimpleTestClient;
+    use super::test_add_exec_client::SimpleTestClient;
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_lifecycle_command_add_then_remove_exec_client() {
@@ -7425,4 +7426,5 @@ mod test_lifecycle_commands {
         assert!(result.is_ok(), "node should run successfully");
         assert_eq!(handle.state(), NodeState::Stopped);
     }
+}
 }
