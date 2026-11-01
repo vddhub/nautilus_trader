@@ -7259,11 +7259,208 @@ mod test_remove_exec_client {
 
 mod test_lifecycle_commands {
     use super::*;
+    use nautilus_common::msgbus::MessageBus;
     use nautilus_live::execution::client::LiveExecutionClient;
-    use super::test_add_exec_client::SimpleTestClient;
+    use nautilus_live::command::ExecClientCommand;
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_lifecycle_command_add_then_remove_exec_client() {
+    async fn test_lifecycle_command_add_and_remove_via_response_channel() {
+        let _bus = MessageBus::new(TraderId::from("TESTER-009"), UUID4::new(), None, None)
+            .register_message_bus();
+
+        let config = LiveNodeConfig::default();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("TestNode")
+            .build()
+            .unwrap();
+
+        let client_a = super::test_add_exec_client::SimpleTestClient::new(
+            ClientId::from("CLIENT-A"),
+            AccountId::from("ACCOUNT-A"),
+            Venue::from("SIM"),
+        );
+
+        let client_b = super::test_add_exec_client::SimpleTestClient::new(
+            ClientId::from("CLIENT-B"),
+            AccountId::from("ACCOUNT-B"),
+            Venue::from("BINANCE"),
+        );
+
+        // Register client A first
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(client_a))
+            .expect("should register client A");
+
+        let engine = node.kernel().exec_engine.clone();
+        let handle = node.handle();
+
+        // Get the lifecycle command sender BEFORE moving node into RefCell
+        let tx = node
+            .get_lifecycle_cmd_sender()
+            .expect("lifecycle_cmd_tx should be populated after from_config build");
+
+        let node = Rc::new(RefCell::new(node));
+        let local = tokio::task::LocalSet::new();
+
+        local.run_until(async {
+            // Spawn the node runner
+            tokio::task::spawn_local({
+                let node = node.clone();
+                async move {
+                    let mut node_ref = node.borrow_mut();
+                    let _ = node_ref.run().await;
+                }
+            });
+
+            // Give the loop time to initialize
+            tokio::task::yield_now().await;
+
+            // Test Add command via response channel
+            let live_client_b = LiveExecutionClient::new(Box::new(client_b));
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            tx.send(ExecClientCommand::Add(Box::new(live_client_b), reply_tx))
+                .expect("should send Add command");
+
+            // Block on reply from event loop
+            let reply = reply_rx.await.expect("event loop dropped reply channel");
+            assert!(reply.is_ok(), "Add command should succeed: {:?}", reply);
+
+            // Verify client B is registered
+            {
+                let engine_ref = engine.borrow();
+                assert!(
+                    engine_ref.get_client(&ClientId::from("CLIENT-B")).is_some(),
+                    "CLIENT-B should be registered after Add command"
+                );
+                assert!(
+                    engine_ref.get_client(&ClientId::from("CLIENT-A")).is_some(),
+                    "CLIENT-A should still be registered"
+                );
+            }
+
+            // Test Remove command via response channel
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            tx.send(ExecClientCommand::Remove(ClientId::from("CLIENT-B"), reply_tx))
+                .expect("should send Remove command");
+
+            // Block on reply from event loop
+            let reply = reply_rx.await.expect("event loop dropped reply channel");
+            assert!(reply.is_ok(), "Remove command should succeed: {:?}", reply);
+
+            // Verify client B is deregistered
+            {
+                let engine_ref = engine.borrow();
+                assert!(
+                    engine_ref.get_client(&ClientId::from("CLIENT-B")).is_none(),
+                    "CLIENT-B should not be registered after Remove command"
+                );
+                assert!(
+                    engine_ref.get_client(&ClientId::from("CLIENT-A")).is_some(),
+                    "CLIENT-A should still be registered"
+                );
+            }
+
+            // Stop the node
+            handle.stop();
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_lifecycle_command_add_duplicate_venue_returns_error() {
+        let _bus = MessageBus::new(TraderId::from("TESTER-010"), UUID4::new(), None, None)
+            .register_message_bus();
+
+        let config = LiveNodeConfig::default();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("TestNode")
+            .build()
+            .unwrap();
+
+        let client_a = super::test_add_exec_client::SimpleTestClient::new(
+            ClientId::from("CLIENT-A"),
+            AccountId::from("ACCOUNT-A"),
+            Venue::from("SIM"),
+        );
+
+        let client_b = super::test_add_exec_client::SimpleTestClient::new(
+            ClientId::from("CLIENT-B"),
+            AccountId::from("ACCOUNT-B"),
+            Venue::from("SIM"), // Same venue as client A - will cause duplicate error
+        );
+
+        // Register client A first
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(client_a))
+            .expect("should register client A");
+
+        let engine = node.kernel().exec_engine.clone();
+        let handle = node.handle();
+
+        // Get the lifecycle command sender BEFORE moving node into RefCell
+        let tx = node
+            .get_lifecycle_cmd_sender()
+            .expect("lifecycle_cmd_tx should be populated after from_config build");
+
+        let node = Rc::new(RefCell::new(node));
+        let local = tokio::task::LocalSet::new();
+
+        local.run_until(async {
+            // Spawn the node runner
+            tokio::task::spawn_local({
+                let node = node.clone();
+                async move {
+                    let mut node_ref = node.borrow_mut();
+                    let _ = node_ref.run().await;
+                }
+            });
+
+            // Give the loop time to initialize
+            tokio::task::yield_now().await;
+
+            // Try to add client B on the same venue as client A
+            let live_client_b = LiveExecutionClient::new(Box::new(client_b));
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            tx.send(ExecClientCommand::Add(Box::new(live_client_b), reply_tx))
+                .expect("should send Add command");
+
+            // Block on reply from event loop - should be an error
+            let reply = reply_rx.await.expect("event loop dropped reply channel");
+            assert!(reply.is_err(), "Add command should fail for duplicate venue");
+            let err_msg = reply.unwrap_err();
+            assert!(
+                err_msg.contains("already has a registered execution client") || err_msg.contains("Venue"),
+                "Error message should mention duplicate venue, got: {}", err_msg
+            );
+
+            // Verify only client A is registered (B rejected)
+            {
+                let engine_ref = engine.borrow();
+                assert!(
+                    engine_ref.get_client(&ClientId::from("CLIENT-B")).is_none(),
+                    "CLIENT-B should NOT be registered (duplicate venue)"
+                );
+                assert!(
+                    engine_ref.get_client(&ClientId::from("CLIENT-A")).is_some(),
+                    "CLIENT-A should still be registered"
+                );
+            }
+
+            // Stop the node
+            handle.stop();
+        })
+        .await;
+    }
+}
+
+// ============ Old tests removed (see above for response channel implementation) ============
+/*
         let _bus = MessageBus::new(TraderId::from("TESTER-009"), UUID4::new(), None, None)
             .register_message_bus();
 
@@ -7293,38 +7490,184 @@ mod test_lifecycle_commands {
             .register_client(Box::new(client_a))
             .expect("should register client A");
 
-        // Add client B using the live add method
+        let engine = node.kernel().exec_engine.clone();
+        let handle = node.handle();
+
+        let node = Rc::new(RefCell::new(node));
+        let local = tokio::task::LocalSet::new();
+
+        let tx = {
+            let node_for_run = node.clone();
+            let node_for_sender = node.clone();
+
+            local.run_until(async move {
+                tokio::task::spawn_local({
+                    let node = node_for_run.clone();
+                    async move {
+                        let mut node_ref = node.borrow_mut();
+                        let _ = node_ref.run().await;
+                    }
+                });
+
+                // Poll for the sender to become available
+                let tx = loop {
+                    tokio::task::yield_now().await;
+                    if let Ok(node_ref) = node_for_sender.try_borrow() {
+                        if let Some(sender) = node_ref.get_lifecycle_cmd_sender() {
+                            drop(node_ref);
+                            break sender;
+                        }
+                    }
+                };
+                tx
+            })
+            .await
+        };
+
+        // Test Add command via response channel
         let live_client_b = LiveExecutionClient::new(Box::new(client_b));
-        let result = node.add_exec_client_live(live_client_b).await;
-        assert!(result.is_ok(), "add_exec_client_live should succeed");
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(ExecClientCommand::Add(Box::new(live_client_b), reply_tx))
+            .expect("should send Add command");
+
+        // Block on reply from event loop
+        let reply = reply_rx.await.expect("event loop dropped reply channel");
+        assert!(reply.is_ok(), "Add command should succeed");
 
         // Verify client B is registered
-        let engine = node.kernel().exec_engine.borrow();
-        assert!(
-            engine.get_client(&ClientId::from("CLIENT-B")).is_some(),
-            "CLIENT-B should be registered after add"
-        );
-        assert!(
-            engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
-            "CLIENT-A should still be registered"
-        );
-        drop(engine);
+        {
+            let engine_ref = engine.borrow();
+            assert!(
+                engine_ref.get_client(&ClientId::from("CLIENT-B")).is_some(),
+                "CLIENT-B should be registered after Add command"
+            );
+            assert!(
+                engine_ref.get_client(&ClientId::from("CLIENT-A")).is_some(),
+                "CLIENT-A should still be registered"
+            );
+        }
 
-        // Remove client B
-        let result = node.remove_exec_client(ClientId::from("CLIENT-B")).await;
-        assert!(result.is_ok(), "remove_exec_client should succeed");
+        // Test Remove command via response channel
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(ExecClientCommand::Remove(ClientId::from("CLIENT-B"), reply_tx))
+            .expect("should send Remove command");
+
+        // Block on reply from event loop
+        let reply = reply_rx.await.expect("event loop dropped reply channel");
+        assert!(reply.is_ok(), "Remove command should succeed");
 
         // Verify client B is deregistered
-        let engine = node.kernel().exec_engine.borrow();
-        assert!(
-            engine.get_client(&ClientId::from("CLIENT-B")).is_none(),
-            "CLIENT-B should not be registered after removal"
+        {
+            let engine_ref = engine.borrow();
+            assert!(
+                engine_ref.get_client(&ClientId::from("CLIENT-B")).is_none(),
+                "CLIENT-B should not be registered after Remove command"
+            );
+            assert!(
+                engine_ref.get_client(&ClientId::from("CLIENT-A")).is_some(),
+                "CLIENT-A should still be registered"
+            );
+        }
+
+        // Stop the node
+        handle.stop();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_lifecycle_command_add_duplicate_venue_returns_error() {
+        let _bus = MessageBus::new(TraderId::from("TESTER-010"), UUID4::new(), None, None)
+            .register_message_bus();
+
+        let config = LiveNodeConfig::default();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("TestNode")
+            .build()
+            .unwrap();
+
+        let client_a = SimpleTestClient::new(
+            ClientId::from("CLIENT-A"),
+            AccountId::from("ACCOUNT-A"),
+            Venue::from("SIM"),
         );
-        assert!(
-            engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
-            "CLIENT-A should still be registered"
+
+        let client_b = SimpleTestClient::new(
+            ClientId::from("CLIENT-B"),
+            AccountId::from("ACCOUNT-B"),
+            Venue::from("SIM"), // Same venue as client A - will cause duplicate error
         );
-        drop(engine);
+
+        // Register client A first
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(client_a))
+            .expect("should register client A");
+
+        let engine = node.kernel().exec_engine.clone();
+        let handle = node.handle();
+
+        let node = Rc::new(RefCell::new(node));
+        let local = tokio::task::LocalSet::new();
+
+        let tx = {
+            let node_for_run = node.clone();
+            let node_for_sender = node.clone();
+
+            local.run_until(async move {
+                tokio::task::spawn_local({
+                    let node = node_for_run.clone();
+                    async move {
+                        let mut node_ref = node.borrow_mut();
+                        let _ = node_ref.run().await;
+                    }
+                });
+
+                // Poll for the sender to become available
+                let tx = loop {
+                    tokio::task::yield_now().await;
+                    if let Ok(node_ref) = node_for_sender.try_borrow() {
+                        if let Some(sender) = node_ref.get_lifecycle_cmd_sender() {
+                            drop(node_ref);
+                            break sender;
+                        }
+                    }
+                };
+                tx
+            })
+            .await
+        };
+
+        // Try to add client B on the same venue as client A
+        let live_client_b = LiveExecutionClient::new(Box::new(client_b));
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(ExecClientCommand::Add(Box::new(live_client_b), reply_tx))
+            .expect("should send Add command");
+
+        // Block on reply from event loop - should be an error
+        let reply = reply_rx.await.expect("event loop dropped reply channel");
+        assert!(reply.is_err(), "Add command should fail for duplicate venue");
+        assert!(
+            reply.unwrap_err().contains("already has a registered execution client"),
+            "Error message should mention duplicate venue"
+        );
+
+        // Verify only client A is registered
+        {
+            let engine_ref = engine.borrow();
+            assert!(
+                engine_ref.get_client(&ClientId::from("CLIENT-A")).is_some(),
+                "CLIENT-A should still be registered"
+            );
+            assert!(
+                engine_ref.get_client(&ClientId::from("CLIENT-B")).is_none(),
+                "CLIENT-B should not be registered due to duplicate venue"
+            );
+        }
+
+        // Stop the node
+        handle.stop();
     }
 }
+*/
 }

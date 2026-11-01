@@ -237,6 +237,8 @@ impl LiveNode {
             exec_manager.register_submission_retention(client);
         }
 
+        let lifecycle_cmd_tx = Some(runner.get_lifecycle_cmd_sender());
+
         Self {
             kernel,
             runner: Some(runner),
@@ -249,7 +251,7 @@ impl LiveNode {
             external_msgbus,
             stream_processors: Vec::new(),
             shutdown_deadline: None,
-            lifecycle_cmd_tx: None,
+            lifecycle_cmd_tx,
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
             _thread_owner: thread_owner,
@@ -2144,8 +2146,19 @@ impl LiveNode {
                         residual_events += 1;
                     }
 
-                    if let Err(e) = self.process_lifecycle_command(cmd).await {
-                        log::error!("Failed to process lifecycle command: {e}");
+                    // Process command and send result back through reply channel
+                    use crate::command::ExecClientCommand;
+                    match cmd {
+                        ExecClientCommand::Add(client, reply_tx) => {
+                            let result = self.add_exec_client_live(*client).await
+                                .map_err(|e| e.to_string());
+                            let _ = reply_tx.send(result);
+                        }
+                        ExecClientCommand::Remove(client_id, reply_tx) => {
+                            let result = self.remove_exec_client(client_id).await
+                                .map_err(|e| e.to_string());
+                            let _ = reply_tx.send(result);
+                        }
                     }
 
                     record_runner_dispatch(
@@ -2499,19 +2512,6 @@ impl LiveNode {
                 self.observe_exec_command_before_dispatch(message.command());
             }
         });
-    }
-
-    async fn process_lifecycle_command(&mut self, cmd: crate::command::ExecClientCommand) -> anyhow::Result<()> {
-        use crate::command::ExecClientCommand;
-
-        match cmd {
-            ExecClientCommand::Add(client) => {
-                self.add_exec_client_live(*client).await
-            }
-            ExecClientCommand::Remove(client_id) => {
-                self.remove_exec_client(client_id).await
-            }
-        }
     }
 
     /// Dispatches a normal-ingress execution event, then commits a direct

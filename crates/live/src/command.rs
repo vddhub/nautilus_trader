@@ -21,20 +21,22 @@ use nautilus_model::identifiers::ClientId;
 
 use crate::execution::client::LiveExecutionClient;
 
+/// Response type for lifecycle commands: `Ok(())` or error message.
+pub type LifecycleCommandResponse = Result<(), String>;
+
 /// Commands for execution client lifecycle management routed through the live node's event loop.
-#[derive(Clone)]
 pub enum ExecClientCommand {
     /// Add a new execution client to the running node.
-    Add(Box<LiveExecutionClient>),
+    Add(Box<LiveExecutionClient>, tokio::sync::oneshot::Sender<LifecycleCommandResponse>),
     /// Remove an execution client by its ID.
-    Remove(ClientId),
+    Remove(ClientId, tokio::sync::oneshot::Sender<LifecycleCommandResponse>),
 }
 
 impl Debug for ExecClientCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Add(client) => f.debug_tuple("Add").field(client).finish(),
-            Self::Remove(client_id) => f.debug_tuple("Remove").field(client_id).finish(),
+            Self::Add(client, _) => f.debug_tuple("Add").field(client).finish(),
+            Self::Remove(client_id, _) => f.debug_tuple("Remove").field(client_id).finish(),
         }
     }
 }

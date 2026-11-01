@@ -2663,15 +2663,9 @@ impl PyLiveNodeBuilder {
                 .map_err(|e| to_pyruntime_err(format!("Failed to create execution client: {e}")))?;
 
             let client = LiveExecutionClient::new(boxed_client);
-            let venue = client.venue();
 
-            // Synchronous precheck: ensure no execution client is already registered for this venue
-            if cache.client_id_for_venue(&venue).is_some() {
-                return Err(to_pyruntime_err(format!(
-                    "Venue {} already has a registered execution client",
-                    venue
-                )));
-            }
+            // Create a oneshot channel for the reply
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
             // Enqueue Add command through the lifecycle channel
             let lifecycle_tx = node
@@ -2679,13 +2673,21 @@ impl PyLiveNodeBuilder {
                 .map_err(|e| to_pyruntime_err(format!("Failed to get lifecycle sender: {e}")))?;
 
             lifecycle_tx
-                .send(ExecClientCommand::Add(Box::new(client)))
+                .send(ExecClientCommand::Add(Box::new(client), reply_tx))
                 .map_err(|e| {
                     to_pyruntime_err(format!(
                         "Failed to enqueue exec client add command: {e}"
                     ))
                 })?;
 
+            // Block on the reply from the event loop, releasing the GIL while waiting
+            let result = py.allow_threads(|| {
+                reply_rx.blocking_recv()
+                    .map_err(|_| "Event loop dropped reply channel".to_string())
+                    .and_then(|r| r)
+            });
+
+            result.map_err(|e| to_pyruntime_err(e))?;
             Ok(())
         })
     }
@@ -2709,22 +2711,35 @@ impl PyLiveNodeBuilder {
             ));
         }
 
-        let node = self.node()?;
-        let client_id = ClientId::new(client_id);
+        Python::attach(|py| -> PyResult<()> {
+            let node = self.node()?;
+            let client_id = ClientId::new(client_id);
 
-        let lifecycle_tx = node
-            .get_lifecycle_cmd_sender()
-            .map_err(|e| to_pyruntime_err(format!("Failed to get lifecycle sender: {e}")))?;
+            // Create a oneshot channel for the reply
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
-        lifecycle_tx
-            .send(ExecClientCommand::Remove(client_id))
-            .map_err(|e| {
-                to_pyruntime_err(format!(
-                    "Failed to enqueue exec client remove command: {e}"
-                ))
-            })?;
+            let lifecycle_tx = node
+                .get_lifecycle_cmd_sender()
+                .map_err(|e| to_pyruntime_err(format!("Failed to get lifecycle sender: {e}")))?;
 
-        Ok(())
+            lifecycle_tx
+                .send(ExecClientCommand::Remove(client_id, reply_tx))
+                .map_err(|e| {
+                    to_pyruntime_err(format!(
+                        "Failed to enqueue exec client remove command: {e}"
+                    ))
+                })?;
+
+            // Block on the reply from the event loop, releasing the GIL while waiting
+            let result = py.allow_threads(|| {
+                reply_rx.blocking_recv()
+                    .map_err(|_| "Event loop dropped reply channel".to_string())
+                    .and_then(|r| r)
+            });
+
+            result.map_err(|e| to_pyruntime_err(e))?;
+            Ok(())
+        })
     }
 
     #[pyo3(name = "build")]
