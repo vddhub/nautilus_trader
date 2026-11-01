@@ -2622,6 +2622,7 @@ impl PyLiveNodeBuilder {
     /// Returns an error if:
     /// - The node is not running.
     /// - The factory extraction or client creation fails.
+    /// - A client for the same venue is already registered.
     /// - Sending the lifecycle command fails.
     #[pyo3(name = "py_add_exec_client_live", signature = (factory, config, routing=None))]
     fn py_add_exec_client_live(
@@ -2658,10 +2659,19 @@ impl PyLiveNodeBuilder {
 
             // Create the client using the factory, mirroring the builder pattern
             let boxed_client = boxed_factory
-                .create(trader_id, &client_id.to_string(), boxed_config, cache, clock)
+                .create(trader_id, &client_id.to_string(), boxed_config, cache.clone(), clock)
                 .map_err(|e| to_pyruntime_err(format!("Failed to create execution client: {e}")))?;
 
             let client = LiveExecutionClient::new(boxed_client);
+            let venue = client.venue();
+
+            // Synchronous precheck: ensure no execution client is already registered for this venue
+            if cache.client_id_for_venue(&venue).is_some() {
+                return Err(to_pyruntime_err(format!(
+                    "Venue {} already has a registered execution client",
+                    venue
+                )));
+            }
 
             // Enqueue Add command through the lifecycle channel
             let lifecycle_tx = node
