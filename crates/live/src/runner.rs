@@ -211,6 +211,7 @@ pub struct AsyncRunnerChannels {
     pub exec_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<TradingCommandMessage>>,
     pub data_evt_rx: tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<DataEvent>>,
     pub data_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<DataCommand>>,
+    pub lifecycle_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<crate::command::ExecClientCommand>,
 }
 
 #[cfg(feature = "node")]
@@ -226,6 +227,7 @@ pub(crate) enum PendingRunnerEvent {
     ExecCommand(DispatchMessage<TradingCommandMessage>),
     DataEvent(DispatchMessage<DataEvent>),
     DataCommand(DispatchMessage<DataCommand>),
+    LifecycleCommand(crate::command::ExecClientCommand),
 }
 
 pub struct AsyncRunner {
@@ -241,6 +243,7 @@ pub struct AsyncRunner {
     exec_cmd_tx: tokio::sync::mpsc::UnboundedSender<DispatchMessage<TradingCommandMessage>>,
     data_evt_tx: tokio::sync::mpsc::UnboundedSender<DispatchMessage<DataEvent>>,
     data_cmd_tx: tokio::sync::mpsc::UnboundedSender<DispatchMessage<DataCommand>>,
+    lifecycle_cmd_tx: tokio::sync::mpsc::UnboundedSender<crate::command::ExecClientCommand>,
 }
 
 /// Handle for stopping the `AsyncRunner` from another context.
@@ -289,6 +292,7 @@ impl AsyncRunner {
         let (exec_cmd_tx, exec_cmd_rx) = unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (data_evt_tx, data_evt_rx) = unbounded_channel::<DispatchMessage<DataEvent>>();
         let (data_cmd_tx, data_cmd_rx) = unbounded_channel::<DispatchMessage<DataCommand>>();
+        let (lifecycle_cmd_tx, lifecycle_cmd_rx) = unbounded_channel::<crate::command::ExecClientCommand>();
 
         Self {
             channels: AsyncRunnerChannels {
@@ -299,6 +303,7 @@ impl AsyncRunner {
                 exec_cmd_rx,
                 data_evt_rx,
                 data_cmd_rx,
+                lifecycle_cmd_rx,
             },
             skip_time: false,
             skip_data: false,
@@ -311,6 +316,7 @@ impl AsyncRunner {
             exec_cmd_tx,
             data_evt_tx,
             data_cmd_tx,
+            lifecycle_cmd_tx,
         }
     }
 
@@ -360,6 +366,12 @@ impl AsyncRunner {
         AsyncRunnerHandle {
             signal_tx: self.signal_tx.clone(),
         }
+    }
+
+    /// Returns a sender for lifecycle commands (execution client add/remove).
+    #[must_use]
+    pub fn get_lifecycle_cmd_sender(&self) -> tokio::sync::mpsc::UnboundedSender<crate::command::ExecClientCommand> {
+        self.lifecycle_cmd_tx.clone()
     }
 
     /// Consumes the runner and returns the channel receivers for direct event loop driving.

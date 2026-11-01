@@ -206,6 +206,7 @@ pub struct LiveNode {
     external_msgbus: Option<ExternalMessageBusIngress>,
     stream_processors: Vec<StreamProcessor>,
     shutdown_deadline: Option<dst::time::Instant>,
+    lifecycle_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::command::ExecClientCommand>>,
     #[cfg(feature = "plugin")]
     plugins: plugin::NodePlugins,
     _thread_owner: Rc<()>,
@@ -248,6 +249,7 @@ impl LiveNode {
             external_msgbus,
             stream_processors: Vec::new(),
             shutdown_deadline: None,
+            lifecycle_cmd_tx: None,
             #[cfg(feature = "plugin")]
             plugins: plugin::NodePlugins,
             _thread_owner: thread_owner,
@@ -393,6 +395,14 @@ impl LiveNode {
     #[must_use]
     pub fn handle(&self) -> LiveNodeHandle {
         self.handle.clone()
+    }
+
+    /// Returns a sender for lifecycle commands (execution client add/remove).
+    ///
+    /// This sender is populated during node startup. Returns `None` if the node has not been run yet.
+    #[must_use]
+    pub fn get_lifecycle_cmd_sender(&self) -> Option<tokio::sync::mpsc::UnboundedSender<crate::command::ExecClientCommand>> {
+        self.lifecycle_cmd_tx.clone()
     }
 
     /// Adds a callback for supported typed external messages.
@@ -1323,6 +1333,9 @@ impl LiveNode {
 
         runner.bind_senders_for_node(self.handle.clone());
 
+        // Capture the lifecycle command sender before consuming the runner
+        self.lifecycle_cmd_tx = Some(runner.get_lifecycle_cmd_sender());
+
         let AsyncRunnerChannels {
             mut time_evt_rx,
             mut system_evt_rx,
@@ -1331,6 +1344,7 @@ impl LiveNode {
             mut exec_cmd_rx,
             mut data_evt_rx,
             mut data_cmd_rx,
+            mut lifecycle_cmd_rx,
         } = runner.take_channels();
 
         log::info!("Event loop starting");
@@ -2118,6 +2132,26 @@ impl LiveNode {
                         metrics_start,
                     );
                 }
+                Some(cmd) = lifecycle_cmd_rx.recv() => {
+                    skip_time = false;
+                    let dispatch_start = dst::time::Instant::now();
+
+                    if is_shutting_down {
+                        log::debug!("Residual lifecycle command: {cmd:?}");
+                        residual_events += 1;
+                    }
+
+                    if let Err(e) = self.process_lifecycle_command(cmd).await {
+                        log::error!("Failed to process lifecycle command: {e}");
+                    }
+
+                    record_runner_dispatch(
+                        &metrics,
+                        SystemChannel::ExecCommands,
+                        dispatch_start,
+                        metrics_start,
+                    );
+                }
                 message = recv_external_msgbus_message(&mut external_msgbus_rx, &mut pending_external) => {
                     skip_time = false;
                     let external_msgbus_start = dst::time::Instant::now();
@@ -2462,6 +2496,19 @@ impl LiveNode {
                 self.observe_exec_command_before_dispatch(message.command());
             }
         });
+    }
+
+    async fn process_lifecycle_command(&mut self, cmd: crate::command::ExecClientCommand) -> anyhow::Result<()> {
+        use crate::command::ExecClientCommand;
+
+        match cmd {
+            ExecClientCommand::Add(client) => {
+                self.add_exec_client_live(*client).await
+            }
+            ExecClientCommand::Remove(client_id) => {
+                self.remove_exec_client(client_id).await
+            }
+        }
     }
 
     /// Dispatches a normal-ingress execution event, then commits a direct

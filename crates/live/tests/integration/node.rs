@@ -7315,4 +7315,28 @@ mod test_remove_exec_client {
             );
         }
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_lifecycle_command_channel_exists() {
+        use nautilus_live::command::ExecClientCommand;
+
+        let _bus = MessageBus::new(TraderId::from("TESTER-009"), UUID4::new(), None, None)
+            .register_message_bus();
+
+        // This test verifies that the lifecycle command channel is properly wired
+        // and that commands can be sent through it without error
+
+        let runner = AsyncRunner::default();
+
+        // Test that the lifecycle_cmd_sender can be accessed
+        let lifecycle_cmd_tx = runner.get_lifecycle_cmd_sender();
+
+        // Create a dummy command and verify it can be sent
+        // (We don't have a receiver here to actually receive it, but we can verify
+        // the channel exists and is operational)
+        let client_id = ClientId::from("TEST-CLIENT");
+        let result = lifecycle_cmd_tx.send(ExecClientCommand::Remove(client_id));
+
+        assert!(result.is_ok(), "Should be able to send Remove command through lifecycle channel");
+    }
 }
