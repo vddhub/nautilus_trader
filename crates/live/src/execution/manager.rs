@@ -1979,11 +1979,6 @@ impl ExecutionManager {
         self.submission_retention.shift_remove(&client_id);
     }
 
-    #[cfg(test)]
-    pub(crate) fn submission_retention_contains(&self, client_id: ClientId) -> bool {
-        self.submission_retention.contains_key(&client_id)
-    }
-
     fn submission_retention_enabled(
         &self,
         client_order_id: ClientOrderId,
@@ -8648,6 +8643,29 @@ mod tests {
                     client_id
                 ])))
             );
+        }
+
+        #[rstest]
+        fn test_deregister_submission_retention_removes_client() {
+            let mut manager = ExecutionManager::new(
+                Rc::new(RefCell::new(VirtualClock::new())),
+                Rc::new(RefCell::new(Cache::default())),
+                ExecutionManagerConfig::default(),
+            )
+            .expect("failed to create ExecutionManager");
+
+            let client_id = ClientId::from("TEST-CLIENT");
+            let account_id = AccountId::from("TEST-001");
+
+            manager
+                .submission_retention
+                .insert(client_id, account_id);
+
+            assert!(manager.submission_retention.contains_key(&client_id));
+
+            manager.deregister_submission_retention(client_id);
+
+            assert!(!manager.submission_retention.contains_key(&client_id));
         }
     }
 }
