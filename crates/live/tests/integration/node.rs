@@ -7360,6 +7360,24 @@ mod test_lifecycle_commands {
         let handle = node.handle();
         let state_handle = handle.clone();
 
+        // Bounded poll helper to wait for a condition (up to 5 seconds).
+        async fn poll_until<F>(mut check: F, timeout_secs: u64) -> bool
+        where
+            F: FnMut() -> bool,
+        {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+            loop {
+                if check() {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
+            }
+        }
+
         // Spawn the node's event loop on the runtime
         tokio::spawn(async move {
             // Wait for the node to reach Running state
@@ -7376,32 +7394,27 @@ mod test_lifecycle_commands {
                 )))
                 .expect("should send Add command");
 
-            // Allow the event loop to process the command
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            // Verify CLIENT-B is now present
-            let engine = exec_engine.borrow();
-            assert!(
-                engine.get_client(&ClientId::from("CLIENT-B")).is_some(),
-                "CLIENT-B should be registered after Add command"
-            );
-            drop(engine);
+            // Poll until CLIENT-B is registered (bounded to 5 seconds)
+            let client_b_id = ClientId::from("CLIENT-B");
+            let added = poll_until(
+                || exec_engine.borrow().get_client(&client_b_id).is_some(),
+                5,
+            )
+            .await;
+            assert!(added, "CLIENT-B should be registered after Add command within 5s");
 
             // Send Remove command for CLIENT-B
             lifecycle_cmd_tx
                 .send(ExecClientCommand::Remove(ClientId::from("CLIENT-B")))
                 .expect("should send Remove command");
 
-            // Allow the event loop to process the command
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            // Verify CLIENT-B is now absent
-            let engine = exec_engine.borrow();
-            assert!(
-                engine.get_client(&ClientId::from("CLIENT-B")).is_none(),
-                "CLIENT-B should be unregistered after Remove command"
-            );
-            drop(engine);
+            // Poll until CLIENT-B is unregistered (bounded to 5 seconds)
+            let removed = poll_until(
+                || exec_engine.borrow().get_client(&client_b_id).is_none(),
+                5,
+            )
+            .await;
+            assert!(removed, "CLIENT-B should be unregistered after Remove command within 5s");
 
             // Stop the node
             state_handle.stop();
