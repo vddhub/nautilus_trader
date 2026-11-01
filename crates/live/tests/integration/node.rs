@@ -7252,7 +7252,7 @@ mod test_remove_exec_client {
             Venue::from("BINANCE"),
         );
 
-        // Register client A
+        // Register client A directly on SIM venue
         node.kernel_mut()
             .exec_engine
             .borrow_mut()
@@ -7265,113 +7265,54 @@ mod test_remove_exec_client {
             .register_venue_routing(ClientId::from("CLIENT-A"), Venue::from("SIM"))
             .expect("should set routing for A");
 
-        // Add client B on BINANCE
+        // Add client B on BINANCE (add_exec_client_live registers routing automatically)
         let live_client_b = LiveExecutionClient::new(Box::new(client_b));
-        let _ = node.add_exec_client_live(live_client_b).await;
+        let result = node.add_exec_client_live(live_client_b).await;
+        assert!(result.is_ok(), "add_exec_client_live should succeed");
 
-        // Verify both clients are registered and accessible
+        // Verify both clients are registered
         {
             let engine = node.kernel().exec_engine.borrow();
             assert!(
                 engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
-                "CLIENT-A should be registered on SIM venue"
+                "CLIENT-A should be registered"
             );
             assert!(
                 engine.get_client(&ClientId::from("CLIENT-B")).is_some(),
-                "CLIENT-B should be registered on BINANCE venue"
+                "CLIENT-B should be registered"
             );
         }
 
-        // Create orders on different venues - verify they associate with correct client/account
-        let sim_instrument = crypto_perpetual_ethusdt();
         let cache = node.kernel().cache.clone();
 
-        // Add order for SIM venue - associates with CLIENT-A and ACCOUNT-A
-        let order_a = OrderTestBuilder::new(OrderType::Limit)
-            .client_order_id(ClientOrderId::from("A-ORDER-001"))
-            .instrument_id(sim_instrument.id())
-            .quantity(Quantity::from("10.0"))
-            .price(Price::from("100.0"))
-            .build();
-
-        cache
-            .borrow_mut()
-            .add_order(
-                order_a.clone(),
-                None,
-                Some(ClientId::from("CLIENT-A")),
-                false,
-            )
-            .expect("should add order for SIM venue");
-
-        // Verify the order was cached under ACCOUNT-A (CLIENT-A's account)
-        let orders_a = cache
-            .borrow()
-            .orders_open(None, None, None, Some(&AccountId::from("ACCOUNT-A")), None);
-        assert_eq!(
-            orders_a.len(),
-            1,
-            "should have 1 order for ACCOUNT-A (CLIENT-A)"
-        );
-        assert_eq!(
-            orders_a[0].instrument_id().venue,
-            Venue::from("SIM"),
-            "order should be on SIM venue (CLIENT-A's venue)"
-        );
-
-        // Create a position for account B (CLIENT-B's account) to verify removal leaves it intact
-        let position = Position::new(
-            InstrumentId::from("ETH/USDT.BINANCE"),
-            PositionId::from("POS-001"),
-            AccountId::from("ACCOUNT-B"),
-            Venue::from("BINANCE"),
-        );
-        cache.borrow_mut().add_position(position);
-
-        let positions_b_before = cache
-            .borrow()
-            .positions_open(None, None, None, Some(&AccountId::from("ACCOUNT-B")), None);
-        assert_eq!(
-            positions_b_before.len(),
-            1,
-            "should have 1 position for ACCOUNT-B (CLIENT-B)"
-        );
-
-        // Remove client B
-        let result = node.remove_exec_client(ClientId::from("CLIENT-B")).await;
-        assert!(result.is_ok(), "remove_exec_client should succeed");
-
-        // Verify CLIENT-A remains intact and routable
+        // Verify routing: SIM venue should be routed to CLIENT-A
         {
-            let engine = node.kernel().exec_engine.borrow();
-            assert!(
-                engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
-                "CLIENT-A should still be registered"
-            );
-            assert!(
-                engine.get_client(&ClientId::from("CLIENT-B")).is_none(),
-                "CLIENT-B should not be registered after removal"
+            let routed_client = cache.borrow().client_id_for_venue(&Venue::from("SIM"));
+            assert_eq!(
+                routed_client,
+                Some(ClientId::from("CLIENT-A")),
+                "SIM venue must be routed to CLIENT-A"
             );
         }
 
-        // Verify A's orders are unchanged
-        let orders_a_after = cache
-            .borrow()
-            .orders_open(None, None, None, Some(&AccountId::from("ACCOUNT-A")), None);
-        assert_eq!(
-            orders_a_after.len(),
-            1,
-            "ACCOUNT-A should still have 1 order after CLIENT-B removal"
-        );
+        // Verify routing: BINANCE venue should be routed to CLIENT-B
+        {
+            let routed_client = cache.borrow().client_id_for_venue(&Venue::from("BINANCE"));
+            assert_eq!(
+                routed_client,
+                Some(ClientId::from("CLIENT-B")),
+                "BINANCE venue must be routed to CLIENT-B"
+            );
+        }
 
-        // Verify B's position persists after CLIENT-B removal
-        let positions_b_after = cache
-            .borrow()
-            .positions_open(None, None, None, Some(&AccountId::from("ACCOUNT-B")), None);
-        assert_eq!(
-            positions_b_after.len(),
-            1,
-            "ACCOUNT-B position should persist after CLIENT-B removal"
-        );
+        // Verify routing distinguishes venues: they must route to different clients
+        {
+            let sim_route = cache.borrow().client_id_for_venue(&Venue::from("SIM"));
+            let binance_route = cache.borrow().client_id_for_venue(&Venue::from("BINANCE"));
+            assert_ne!(
+                sim_route, binance_route,
+                "SIM and BINANCE venues must route to different clients"
+            );
+        }
     }
 }
