@@ -657,6 +657,15 @@ impl LiveNode {
     ///
     /// Returns an error if venue is already registered, registration fails, connection fails,
     /// or reconciliation fails.
+    fn rollback_added_exec_client(&mut self, client_id: ClientId) {
+        {
+            let mut engine = self.kernel.exec_engine.borrow_mut();
+            let _ = engine.deregister_client(client_id);
+        }
+        self.exec_manager.deregister_submission_retention(client_id);
+        self.exec_clients.retain(|c| c.client_id() != client_id);
+    }
+
     pub async fn add_exec_client_live(
         &mut self,
         client: LiveExecutionClient,
@@ -689,9 +698,8 @@ impl LiveNode {
             let mut engine = self.kernel.exec_engine.borrow_mut();
             if let Err(e) = engine.register_venue_routing(client_id, venue) {
                 // Rollback on routing failure
-                let _ = engine.deregister_client(client_id);
                 drop(engine);
-                self.exec_manager.deregister_submission_retention(client_id);
+                self.rollback_added_exec_client(client_id);
                 return Err(e);
             }
         }
@@ -706,12 +714,8 @@ impl LiveNode {
             let mut engine = self.kernel.exec_engine.borrow_mut();
             if let Err(e) = engine.connect_client(client_id).await {
                 // Rollback on connect failure
-                let _ = engine.deregister_client(client_id);
                 drop(engine);
-                self.exec_manager.deregister_submission_retention(client_id);
-                if let Some(pos) = self.exec_clients.iter().position(|c| c.client_id() == client_id) {
-                    self.exec_clients.remove(pos);
-                }
+                self.rollback_added_exec_client(client_id);
                 return Err(e);
             }
         }
@@ -799,14 +803,7 @@ impl LiveNode {
             }
             Err(e) => {
                 // Rollback on reconciliation error
-                {
-                    let mut engine = self.kernel.exec_engine.borrow_mut();
-                    let _ = engine.deregister_client(client_id);
-                }
-                self.exec_manager.deregister_submission_retention(client_id);
-                if let Some(pos) = self.exec_clients.iter().position(|c| c.client_id() == client_id) {
-                    self.exec_clients.remove(pos);
-                }
+                self.rollback_added_exec_client(client_id);
                 return Err(e).context(format!("Failed to get mass status from {client_id}"));
             }
         }
