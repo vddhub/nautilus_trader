@@ -6,6 +6,8 @@ Target: many tenants (each their own exchange account) sharing host + infra, wit
 
 ## 1. High-level components
 
+This is a **topology** view (what lives where). The detailed data/order/fill flow is in §3.
+
 ```mermaid
 flowchart TB
   subgraph CP["Control plane (your service)"]
@@ -14,50 +16,27 @@ flowchart TB
   end
 
   subgraph HOST["One host (16 GB) — shared"]
-    subgraph FEED["Feed node (1 per venue, data-only)"]
-      DC["DataClient (public WS)"]
-    end
-    subgraph NODE["Tenant node(s) — LiveNode / NautilusKernel"]
-      LOOP["tokio event loop (single thread)"]
-      LC["lifecycle_cmd channel<br/>ExecClientCommand + oneshot reply"]
-      DE["DataEngine"]
-      EE["ExecutionEngine<br/>routing_map venue→client"]
-      RE["RiskEngine"]
-      PF["Portfolio"]
-      CA["Cache"]
+    FEED["Feed node (1 per venue, data-only)<br/>DataClient — public WS"]
+    subgraph NODE["Tenant node — LiveNode / NautilusKernel<br/>single-thread event loop"]
+      KERNEL["DataEngine · RiskEngine · ExecutionEngine<br/>Portfolio · Cache"]
       EC1["ExecClient: TENANT-A acct"]
       EC2["ExecClient: TENANT-B acct"]
-      ST1["Strategy/Actor: bot A"]
-      ST2["Strategy/Actor: bot B"]
+      BOTS["Strategies / Actors: bot A, bot B"]
     end
-    RED[("Redis<br/>cache DB + msgbus streams<br/>key: trader-{id}:{instance}")]
+    RED[("Redis<br/>cache + msgbus streams<br/>key: trader-{id}")]
   end
 
   VEN["Exchanges (Binance/Bybit/…)<br/>public data + private per-account"]
 
-  %% lifecycle (runtime add/remove)
-  API -->|"add_exec_client_live_async / remove_exec_client_async"| LC
+  API -->|"add/remove exec client (lifecycle)"| KERNEL
   API -.- DB
-  LC --> LOOP
-  LOOP -->|"apply add/remove"| EE
-
-  %% market data in (venue -> feed -> redis -> node -> strategies)
-  VEN -->|"public WS (once/venue)"| DC
-  DC -->|publish| RED
-  RED -->|"external_streams ingest"| DE
-  DE -->|"on_quote / on_bar"| ST1 & ST2
-
-  %% order out (strategy -> risk -> exec -> client -> venue)
-  ST1 & ST2 -->|"submit_order (client_id)"| RE
-  RE -->|"approved (pre-trade, per account)"| EE
-  EE -->|"route by client_id"| EC1 & EC2
-  EC1 & EC2 -->|"orders: private WS/REST"| VEN
-
-  %% fills back (venue -> client -> exec -> portfolio/cache)
-  VEN -->|"fills / acks"| EC1 & EC2
-  EC1 & EC2 -->|events| EE
-  EE -->|"update per account_id"| PF & CA
-  CA -.->|persist| RED
+  BOTS -->|"submit_order (client_id)"| KERNEL
+  KERNEL -->|"route by client_id"| EC1 & EC2
+  EC1 & EC2 -->|"orders + fills (private, per account)"| VEN
+  FEED -->|"market data (Redis external_streams)"| KERNEL
+  FEED -->|"public WS"| VEN
+  KERNEL -.- RED
+  FEED -.- RED
 ```
 
 Key points:
