@@ -6867,7 +6867,7 @@ mod test_add_exec_client {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_add_two_accounts_same_venue() {
+    async fn test_add_two_accounts_same_venue_registers_both() {
         let _bus = MessageBus::new(TraderId::from("TESTER-011"), UUID4::new(), None, None)
             .register_message_bus();
 

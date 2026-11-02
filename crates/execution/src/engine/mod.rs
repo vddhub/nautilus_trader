@@ -2370,6 +2370,7 @@ impl ExecutionEngine {
             && let Some(client_id) = self.routing_map.get(&instrument_id.venue)
             && let Some(adapter) = self.clients.get(client_id)
         {
+            log::debug!("Command routed to venue default client: venue={}, client_id={}", instrument_id.venue, client_id);
             return Some(adapter);
         }
 
