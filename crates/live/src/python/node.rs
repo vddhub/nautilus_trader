@@ -107,6 +107,24 @@ use crate::{
 /// remainder of a hosted run. Every method then fails with a clear error rather than aliasing the
 /// node the run future is driving. Capture `cache`, `portfolio`, and `handle` before starting a
 /// hosted run; each is an independent handle that stays usable while the node runs.
+/// State captured before `run_async` takes the node, so runtime exec-client add/remove
+/// can still build a client and enqueue lifecycle commands while the node is running.
+/// All fields are single-thread (`Rc`); `PyLiveNode` is `unsendable`, so this never crosses threads.
+struct CapturedRunState {
+    lifecycle_tx: tokio::sync::mpsc::UnboundedSender<ExecClientCommand>,
+    trader_id: TraderId,
+    cache: Rc<RefCell<nautilus_common::cache::Cache>>,
+    clock: Rc<RefCell<dyn nautilus_common::clock::Clock>>,
+}
+
+impl std::fmt::Debug for CapturedRunState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapturedRunState")
+            .field("trader_id", &self.trader_id)
+            .finish_non_exhaustive()
+    }
+}
+
 #[pyo3::pyclass(module = "nautilus_trader.live", name = "LiveNode", unsendable)]
 #[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")]
 #[derive(Debug)]
@@ -114,6 +132,7 @@ pub struct PyLiveNode {
     inner: Rc<RefCell<Option<LiveNode>>>,
     handle: LiveNodeHandle,
     clients: PythonClients,
+    run_state: RefCell<Option<CapturedRunState>>,
 }
 
 impl PyLiveNode {
@@ -126,7 +145,58 @@ impl PyLiveNode {
             inner: Rc::new(RefCell::new(Some(node))),
             handle,
             clients: PythonClients::default(),
+            run_state: RefCell::new(None),
         }
+    }
+
+    /// Captures the lifecycle sender + kernel refs before a hosted run takes the node, so
+    /// `add_exec_client_live_async` / `remove_exec_client_async` keep working during the run.
+    fn capture_run_state(&self) -> PyResult<()> {
+        let node = self.node()?;
+        let lifecycle_tx = node.get_lifecycle_cmd_sender().ok_or_else(|| {
+            to_pyruntime_err("Failed to get lifecycle sender: node has not been run yet")
+        })?;
+        *self.run_state.borrow_mut() = Some(CapturedRunState {
+            lifecycle_tx,
+            trader_id: node.trader_id(),
+            cache: node.kernel().cache(),
+            clock: node.kernel().clock(),
+        });
+        Ok(())
+    }
+
+    /// Resolves the lifecycle context from the live node if present, else from the state
+    /// captured before the run took the node.
+    fn lifecycle_ctx(
+        &self,
+    ) -> PyResult<(
+        tokio::sync::mpsc::UnboundedSender<ExecClientCommand>,
+        TraderId,
+        Rc<RefCell<nautilus_common::cache::Cache>>,
+        Rc<RefCell<dyn nautilus_common::clock::Clock>>,
+    )> {
+        if let Ok(node) = self.node() {
+            let lifecycle_tx = node.get_lifecycle_cmd_sender().ok_or_else(|| {
+                to_pyruntime_err("Failed to get lifecycle sender: node has not been run yet")
+            })?;
+            return Ok((
+                lifecycle_tx,
+                node.trader_id(),
+                node.kernel().cache(),
+                node.kernel().clock(),
+            ));
+        }
+        if let Some(rs) = self.run_state.borrow().as_ref() {
+            return Ok((
+                rs.lifecycle_tx.clone(),
+                rs.trader_id,
+                rs.cache.clone(),
+                rs.clock.clone(),
+            ));
+        }
+        Err(to_pyruntime_err(
+            "Node not available; run the node before adding or removing execution clients",
+        ))
     }
 
     fn node(&self) -> PyResult<Ref<'_, LiveNode>> {
@@ -1032,6 +1102,10 @@ impl PyLiveNode {
             ));
         }
 
+        // Capture lifecycle sender + kernel refs before the run takes the node, so runtime
+        // exec-client add/remove keep working while the node is owned by the hosted run.
+        self.capture_run_state()?;
+
         // Everything fallible happens before the node is taken, so a failure here cannot strand
         // it. `PyNodeRun` restores the node on drop, covering the paths after this point.
         let driver = node_run_driver(py)?.clone_ref(py);
@@ -1663,6 +1737,75 @@ impl PyLiveNode {
             })
         })
     }
+
+    /// Async variant of `py_add_exec_client_live` for use on a host asyncio loop
+    /// (`run_async`). Returns an awaitable that resolves once the running node's event
+    /// loop has processed the add and reconciled, or raises with the real failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node is not running, the client cannot be built, or the
+    /// add fails on the event loop (duplicate venue, connect, or reconcile).
+    #[pyo3(name = "add_exec_client_live_async")]
+    fn py_add_exec_client_live_async<'py>(
+        &self,
+        py: Python<'py>,
+        factory: Py<PyAny>,
+        config: Py<PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if !self.handle.is_running() {
+            return Err(to_pyruntime_err(
+                "Node is not running; add clients to a running node",
+            ));
+        }
+
+        let (lifecycle_tx, trader_id, cache, clock) = self.lifecycle_ctx()?;
+        let (_client_id, client) =
+            Self::build_live_exec_client(py, &factory, &config, trader_id, &cache, clock)?;
+        let reply_rx = Self::enqueue_lifecycle_command(&lifecycle_tx, |reply_tx| {
+            ExecClientCommand::Add(Box::new(client), reply_tx)
+        })?;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            reply_rx
+                .await
+                .map_err(|_| to_pyruntime_err("Event loop dropped reply channel"))?
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
+    /// Async variant of `py_remove_exec_client` for use on a host asyncio loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node is not running or the removal fails on the event loop.
+    #[pyo3(name = "remove_exec_client_async")]
+    fn py_remove_exec_client_async<'py>(
+        &self,
+        py: Python<'py>,
+        client_id: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if !self.handle.is_running() {
+            return Err(to_pyruntime_err(
+                "Node is not running; remove clients from a running node",
+            ));
+        }
+
+        let client_id = ClientId::new(client_id);
+        let (lifecycle_tx, _trader_id, _cache, _clock) = self.lifecycle_ctx()?;
+        let reply_rx = Self::enqueue_lifecycle_command(&lifecycle_tx, |reply_tx| {
+            ExecClientCommand::Remove(client_id, reply_tx)
+        })?;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            reply_rx
+                .await
+                .map_err(|_| to_pyruntime_err("Event loop dropped reply channel"))?
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
 }
 
 impl LiveNode {
@@ -1866,6 +2009,52 @@ impl LiveNode {
 }
 
 impl PyLiveNode {
+    /// Builds a live execution client from a Python factory + config, trying the regular
+    /// execution-factory registry first and falling back to the simulated-factory registry
+    /// (so no-creds simulated adapters like Sandbox also work for runtime add).
+    fn build_live_exec_client(
+        py: Python<'_>,
+        factory: &Py<PyAny>,
+        config: &Py<PyAny>,
+        trader_id: TraderId,
+        cache: &Rc<RefCell<nautilus_common::cache::Cache>>,
+        clock: Rc<RefCell<dyn nautilus_common::clock::Clock>>,
+    ) -> PyResult<(ClientId, LiveExecutionClient)> {
+        let registry = get_global_pyo3_registry();
+        let boxed_config = registry.extract_config(py, config.clone_ref(py))?;
+        let factory_name = factory.getattr(py, "name")?.call0(py)?.extract::<String>(py)?;
+        let client_id = ClientId::new(factory_name);
+
+        let boxed_client = match registry.extract_exec_factory(py, factory.clone_ref(py)) {
+            Ok(f) => f
+                .create(trader_id, &client_id.to_string(), &*boxed_config, cache.clone().into(), clock)
+                .map_err(|e| to_pyruntime_err(format!("Failed to create execution client: {e}")))?,
+            Err(_) => {
+                let f = registry.extract_sim_exec_factory(py, factory.clone_ref(py))?;
+                f.create(trader_id, &client_id.to_string(), &*boxed_config, cache.clone())
+                    .map_err(|e| {
+                        to_pyruntime_err(format!("Failed to create simulated execution client: {e}"))
+                    })?
+            }
+        };
+
+        Ok((client_id, LiveExecutionClient::new(boxed_client)))
+    }
+
+    fn enqueue_lifecycle_command<F>(
+        sender: &tokio::sync::mpsc::UnboundedSender<ExecClientCommand>,
+        make_cmd: F,
+    ) -> PyResult<tokio::sync::oneshot::Receiver<crate::command::LifecycleCommandResponse>>
+    where
+        F: FnOnce(tokio::sync::oneshot::Sender<crate::command::LifecycleCommandResponse>) -> ExecClientCommand,
+    {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        sender.send(make_cmd(reply_tx)).map_err(|e| {
+            to_pyruntime_err(format!("Failed to enqueue exec client command: {e}"))
+        })?;
+        Ok(reply_rx)
+    }
+
     fn send_lifecycle_command_and_await<F>(
         py: Python<'_>,
         sender: &tokio::sync::mpsc::UnboundedSender<ExecClientCommand>,
@@ -1874,12 +2063,7 @@ impl PyLiveNode {
     where
         F: FnOnce(tokio::sync::oneshot::Sender<crate::command::LifecycleCommandResponse>) -> ExecClientCommand,
     {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        sender.send(make_cmd(reply_tx)).map_err(|e| {
-            to_pyruntime_err(format!(
-                "Failed to enqueue exec client command: {e}"
-            ))
-        })?;
+        let reply_rx = Self::enqueue_lifecycle_command(sender, make_cmd)?;
 
         let result = py.detach(|| {
             reply_rx.blocking_recv()

@@ -54,6 +54,7 @@ python = [
   "nautilus-testkit?/python",
   "nautilus-trading/python",
   "pyo3",
+  "pyo3-async-runtimes",
   "pyo3-stub-gen",
   "streaming",
 ]
@@ -121,6 +122,7 @@ ustr = { workspace = true }
 
 libfuzzer-sys = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
+pyo3-async-runtimes = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]

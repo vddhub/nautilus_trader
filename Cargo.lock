@@ -6707,6 +6707,7 @@ dependencies = [
  "parking_lot 0.13.0",
  "proptest",
  "pyo3",
+ "pyo3-async-runtimes",
  "pyo3-stub-gen",
  "rstest",
  "rust_decimal",
