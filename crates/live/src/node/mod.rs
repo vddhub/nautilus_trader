@@ -673,34 +673,29 @@ impl LiveNode {
         let client_id = client.client_id();
         let venue = client.venue();
 
-        // Guard: Check if venue already has a registered client
-        {
-            let engine = self.kernel.exec_engine.borrow();
-            for client in engine.get_all_clients() {
-                if client.venue() == venue {
-                    anyhow::bail!(
-                        "Venue {venue} already has a registered account ({}), \
-                         cannot add another account on the same venue",
-                        client.client_id()
-                    );
-                }
-            }
-        }
-
         // Register the client with the engine
         {
             let mut engine = self.kernel.exec_engine.borrow_mut();
             engine.register_client(Box::new(client.clone()))?;
         }
 
-        // Set venue routing
+        // Set venue routing only if this is the first client for this venue
         {
             let mut engine = self.kernel.exec_engine.borrow_mut();
-            if let Err(e) = engine.register_venue_routing(client_id, venue) {
-                // Rollback on routing failure
-                drop(engine);
-                self.rollback_added_exec_client(client_id);
-                return Err(e);
+            let existing_client_count = engine
+                .get_all_clients()
+                .iter()
+                .filter(|c| c.venue() == venue)
+                .count();
+
+            // Only register venue routing if this is the first client on this venue
+            if existing_client_count == 1 {
+                if let Err(e) = engine.register_venue_routing(client_id, venue) {
+                    // Rollback on routing failure
+                    drop(engine);
+                    self.rollback_added_exec_client(client_id);
+                    return Err(e);
+                }
             }
         }
 

@@ -6780,62 +6780,6 @@ mod test_add_exec_client {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_add_exec_client_rejects_duplicate_venue() {
-        let _bus = MessageBus::new(TraderId::from("TESTER-003"), UUID4::new(), None, None)
-            .register_message_bus();
-
-        let config = LiveNodeConfig::default();
-        let mut node = LiveNodeBuilder::from_config(config)
-            .unwrap()
-            .with_name("TestNode")
-            .build()
-            .unwrap();
-
-        let client_a = SimpleTestClient::new(
-            ClientId::from("CLIENT-A"),
-            AccountId::from("ACCOUNT-A"),
-            Venue::from("BINANCE"),
-        );
-
-        let client_b = SimpleTestClient::new(
-            ClientId::from("CLIENT-B"),
-            AccountId::from("ACCOUNT-B"),
-            Venue::from("BINANCE"),
-        );
-
-        node.kernel_mut()
-            .exec_engine
-            .borrow_mut()
-            .register_client(Box::new(client_a))
-            .expect("should register client A");
-
-        node.kernel_mut()
-            .exec_engine
-            .borrow_mut()
-            .register_venue_routing(ClientId::from("CLIENT-A"), Venue::from("BINANCE"))
-            .expect("should set venue routing");
-
-        let live_client_b = LiveExecutionClient::new(Box::new(client_b));
-
-        let result = node.add_exec_client_live(live_client_b).await;
-
-        assert!(
-            result.is_err(),
-            "add_exec_client_live should reject duplicate venue"
-        );
-
-        let engine = node.kernel().exec_engine.borrow();
-        assert!(
-            engine.get_client(&ClientId::from("CLIENT-B")).is_none(),
-            "CLIENT-B should not be registered"
-        );
-        assert!(
-            engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
-            "CLIENT-A should still be registered"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn test_add_exec_client_rolls_back_on_connect_failure() {
         let _bus = MessageBus::new(TraderId::from("TESTER-004"), UUID4::new(), None, None)
             .register_message_bus();
@@ -6909,6 +6853,116 @@ mod test_add_exec_client {
             "CLIENT-A should still be registered"
         );
 
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_add_two_accounts_same_venue() {
+        let _bus = MessageBus::new(TraderId::from("TESTER-011"), UUID4::new(), None, None)
+            .register_message_bus();
+
+        let config = LiveNodeConfig::default();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("TestNode")
+            .build()
+            .unwrap();
+
+        let client_a = SimpleTestClient::new(
+            ClientId::from("CLIENT-A"),
+            AccountId::from("ACCOUNT-A"),
+            Venue::from("SIM"),
+        );
+
+        let client_b = SimpleTestClient::new(
+            ClientId::from("CLIENT-B"),
+            AccountId::from("ACCOUNT-B"),
+            Venue::from("SIM"), // Same venue as client A
+        );
+
+        // Register client A and set venue routing
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_client(Box::new(client_a))
+            .expect("should register client A");
+
+        node.kernel_mut()
+            .exec_engine
+            .borrow_mut()
+            .register_venue_routing(ClientId::from("CLIENT-A"), Venue::from("SIM"))
+            .expect("should set venue routing for SIM");
+
+        let live_client_b = LiveExecutionClient::new(Box::new(client_b));
+
+        // This should succeed after fix
+        let result = node.add_exec_client_live(live_client_b).await;
+
+        assert!(
+            result.is_ok(),
+            "add_exec_client_live should succeed for 2nd client on same venue"
+        );
+
+        let engine = node.kernel().exec_engine.borrow();
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-A")).is_some(),
+            "CLIENT-A should be registered"
+        );
+        assert!(
+            engine.get_client(&ClientId::from("CLIENT-B")).is_some(),
+            "CLIENT-B should be registered"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_same_venue_order_routes_by_client_id() {
+        let _bus = MessageBus::new(TraderId::from("TESTER-012"), UUID4::new(), None, None)
+            .register_message_bus();
+
+        let config = LiveNodeConfig::default();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("TestNode")
+            .build()
+            .unwrap();
+
+        let client_a = SimpleTestClient::new(
+            ClientId::from("CLIENT-A"),
+            AccountId::from("ACCOUNT-A"),
+            Venue::from("SIM"),
+        );
+
+        let client_b = SimpleTestClient::new(
+            ClientId::from("CLIENT-B"),
+            AccountId::from("ACCOUNT-B"),
+            Venue::from("SIM"), // Same venue as client A
+        );
+
+        // Register both clients
+        {
+            let mut engine = node.kernel_mut().exec_engine.borrow_mut();
+            engine.register_client(Box::new(client_a)).expect("should register client A");
+            engine.register_venue_routing(ClientId::from("CLIENT-A"), Venue::from("SIM"))
+                .expect("should set venue routing for SIM");
+        }
+
+        let live_client_b = LiveExecutionClient::new(Box::new(client_b));
+        node.add_exec_client_live(live_client_b).await
+            .expect("should add client B on same venue");
+
+        // Verify both clients are registered and resolvable by explicit client_id
+        let engine = node.kernel().exec_engine.borrow();
+
+        // Both clients should be resolvable by explicit client_id
+        let client_a_explicit = engine.get_client(&ClientId::from("CLIENT-A"));
+        assert!(client_a_explicit.is_some(), "CLIENT-A should be resolvable");
+
+        let client_b_explicit = engine.get_client(&ClientId::from("CLIENT-B"));
+        assert!(client_b_explicit.is_some(), "CLIENT-B should be resolvable");
+
+        // Verify routing map points to A for SIM (default/first)
+        let all_client_ids = engine.client_ids();
+        assert!(all_client_ids.contains(&ClientId::from("CLIENT-A")), "CLIENT-A should be in client list");
+        assert!(all_client_ids.contains(&ClientId::from("CLIENT-B")), "CLIENT-B should be in client list");
     }
 }
 
@@ -7370,7 +7424,7 @@ mod test_lifecycle_commands {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_lifecycle_command_add_duplicate_venue_returns_error() {
+    async fn test_lifecycle_command_add_duplicate_venue_succeeds() {
         let _bus = MessageBus::new(TraderId::from("TESTER-010"), UUID4::new(), None, None)
             .register_message_bus();
 
@@ -7390,7 +7444,7 @@ mod test_lifecycle_commands {
         let client_b = super::test_add_exec_client::SimpleTestClient::new(
             ClientId::from("CLIENT-B"),
             AccountId::from("ACCOUNT-B"),
-            Venue::from("SIM"), // Same venue as client A - will cause duplicate error
+            Venue::from("SIM"), // Same venue as client A - now allowed
         );
 
         // Register client A first
@@ -7424,27 +7478,22 @@ mod test_lifecycle_commands {
             // Give the loop time to initialize
             tokio::task::yield_now().await;
 
-            // Try to add client B on the same venue as client A
+            // Try to add client B on the same venue as client A - now allowed
             let live_client_b = LiveExecutionClient::new(Box::new(client_b));
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
             tx.send(ExecClientCommand::Add(Box::new(live_client_b), reply_tx))
                 .expect("should send Add command");
 
-            // Block on reply from event loop - should be an error
+            // Block on reply from event loop - should succeed
             let reply = reply_rx.await.expect("event loop dropped reply channel");
-            assert!(reply.is_err(), "Add command should fail for duplicate venue");
-            let err_msg = reply.unwrap_err();
-            assert!(
-                err_msg.contains("already has a registered execution client") || err_msg.contains("Venue"),
-                "Error message should mention duplicate venue, got: {}", err_msg
-            );
+            assert!(reply.is_ok(), "Add command should succeed for 2nd client on same venue");
 
-            // Verify only client A is registered (B rejected)
+            // Verify both clients are registered
             {
                 let engine_ref = engine.borrow();
                 assert!(
-                    engine_ref.get_client(&ClientId::from("CLIENT-B")).is_none(),
-                    "CLIENT-B should NOT be registered (duplicate venue)"
+                    engine_ref.get_client(&ClientId::from("CLIENT-B")).is_some(),
+                    "CLIENT-B should be registered on same venue as CLIENT-A"
                 );
                 assert!(
                     engine_ref.get_client(&ClientId::from("CLIENT-A")).is_some(),

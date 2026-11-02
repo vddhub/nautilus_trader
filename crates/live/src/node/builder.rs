@@ -690,7 +690,6 @@ impl LiveNodeBuilder {
         let mut exec_clients = Vec::new();
         let mut venue_candidates = AHashMap::<Venue, Vec<_>>::new();
         let mut venues_explicit = AHashSet::new();
-        let mut has_default_client = false;
         let mut instrument_venues = AHashSet::new();
         let mut self_settling_venues = AHashSet::new();
 
@@ -728,13 +727,16 @@ impl LiveNodeBuilder {
 
                     if routing.default {
                         exec_engine.set_default_client(client_id)?;
-                        has_default_client = true;
                     }
 
                     if let Some(venues) = &routing.venues {
                         for venue_str in venues {
                             let route_venue = Venue::new(venue_str.as_str());
-                            exec_engine.register_venue_routing(client_id, route_venue)?;
+                            // Only register venue routing if this is the first client on this venue
+                            // Additional clients on the same venue are routed by explicit client_id
+                            if !venues_explicit.contains(&route_venue) {
+                                exec_engine.register_venue_routing(client_id, route_venue)?;
+                            }
                             venues_explicit.insert(route_venue);
                             instrument_venues.insert(route_venue);
 
@@ -768,12 +770,10 @@ impl LiveNodeBuilder {
                     continue;
                 }
 
-                if let [client_id] = candidates.as_slice() {
-                    exec_engine.register_venue_routing(*client_id, venue)?;
-                } else if !has_default_client {
-                    anyhow::bail!(
-                        "Multiple execution clients for venue {venue}: configure an explicit venue route or default client"
-                    );
+                // Register venue routing for the first client on this venue
+                // Additional clients on the same venue are routed by explicit client_id
+                if !candidates.is_empty() {
+                    exec_engine.register_venue_routing(candidates[0], venue)?;
                 }
             }
         }
