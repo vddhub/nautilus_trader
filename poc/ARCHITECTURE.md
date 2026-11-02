@@ -35,17 +35,20 @@ flowchart TB
 
   VEN["Exchanges (Binance/Bybit/…)<br/>public data + private per-account"]
 
-  API -->|"py_add_exec_client_live / py_remove_exec_client"| LC
+  API -->|"add_exec_client_live_async / remove_exec_client_async"| LC
   API --- DB
   LC --> LOOP
-  LOOP --> EE
-  EE --- EC1 & EC2
-  ST1 & ST2 --> EE
-  DE --> ST1 & ST2
+  LOOP -->|drives engines| EE
+  DE -->|"on_quote / on_bar"| ST1 & ST2
+  ST1 & ST2 -->|"submit_order (client_id)"| RE
+  RE -->|"approved (pre-trade, per-account)"| EE
+  EE -->|"route by client_id"| EC1 & EC2
+  EC1 & EC2 -->|"private WS/REST per account"| VEN
+  EC1 & EC2 -->|"fills / events"| EE
+  EE -->|"update per account_id"| PF & CA
   FEED -->|"Redis external_streams fan-out"| DE
   DC -->|"public WS (once/venue)"| VEN
-  EC1 & EC2 -->|"private WS/REST per account"| VEN
-  NODE --- RED
+  CA --- RED
   FEED --- RED
 ```
 
@@ -80,7 +83,7 @@ sequenceDiagram
   EE->>EE: reconcile ONLY this client (rollback all on any failure)
   EE-->>EL: Result
   EL-->>CH: reply_tx.send(Result)
-  CH-->>PB: blocking_recv returns
+  CH-->>PB: reply received (await resolves / blocking_recv returns)
   PB-->>CP: Ok(())  OR  raise (duplicate client_id / connect / reconcile error)
 ```
 
@@ -94,10 +97,13 @@ flowchart LR
   FDC -->|publish| FRED[("Redis stream (feed)")]
   FRED -->|external_streams ingest| DE["Tenant node DataEngine"]
   DE -->|"on_quote/on_bar"| BOT["bot A / bot B (strategies)"]
-  BOT -->|submit_order client_id=TENANT-A| EE["ExecutionEngine"]
-  EE -->|route by explicit client_id<br/>(venue default if omitted)| ECA["ExecClient TENANT-A"]
+  BOT -->|"submit_order client_id=TENANT-A"| RE["RiskEngine<br/>pre-trade, per account"]
+  RE -->|approved| EE["ExecutionEngine"]
+  EE -->|"route by explicit client_id<br/>(venue default if omitted)"| ECA["ExecClient TENANT-A"]
   ECA -->|private WS/REST| VEN2["Exchange (account A)"]
-  VEN2 -->|fills/events| ECA --> PF["Portfolio + Cache"]
+  VEN2 -->|fills/events| ECA
+  ECA -->|report| EE
+  EE -->|"update per account_id"| PF["Portfolio + Cache"]
 ```
 
 Isolation: cache/portfolio/orders keyed by `trader_id` + per-account `account_id`. **v2 (shipped):** two tenants on the *same* venue in one node are fully isolated — orders carry explicit `client_id`/`account_id`; RiskEngine pre-trade and Portfolio reads resolve per account; the venue→account fallback is kept but fail-closed (returns the single account, or `None` when 2+, never a wrong one). Adding a 2nd same-venue account is allowed; the only remaining uniqueness constraint is `client_id`.
