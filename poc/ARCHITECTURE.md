@@ -35,21 +35,29 @@ flowchart TB
 
   VEN["Exchanges (Binance/Bybit/…)<br/>public data + private per-account"]
 
+  %% lifecycle (runtime add/remove)
   API -->|"add_exec_client_live_async / remove_exec_client_async"| LC
-  API --- DB
+  API -.- DB
   LC --> LOOP
-  LOOP -->|drives engines| EE
+  LOOP -->|"apply add/remove"| EE
+
+  %% market data in (venue -> feed -> redis -> node -> strategies)
+  VEN -->|"public WS (once/venue)"| DC
+  DC -->|publish| RED
+  RED -->|"external_streams ingest"| DE
   DE -->|"on_quote / on_bar"| ST1 & ST2
+
+  %% order out (strategy -> risk -> exec -> client -> venue)
   ST1 & ST2 -->|"submit_order (client_id)"| RE
-  RE -->|"approved (pre-trade, per-account)"| EE
+  RE -->|"approved (pre-trade, per account)"| EE
   EE -->|"route by client_id"| EC1 & EC2
-  EC1 & EC2 -->|"private WS/REST per account"| VEN
-  EC1 & EC2 -->|"fills / events"| EE
+  EC1 & EC2 -->|"orders: private WS/REST"| VEN
+
+  %% fills back (venue -> client -> exec -> portfolio/cache)
+  VEN -->|"fills / acks"| EC1 & EC2
+  EC1 & EC2 -->|events| EE
   EE -->|"update per account_id"| PF & CA
-  FEED -->|"Redis external_streams fan-out"| DE
-  DC -->|"public WS (once/venue)"| VEN
-  CA --- RED
-  FEED --- RED
+  CA -.->|persist| RED
 ```
 
 Key points:
