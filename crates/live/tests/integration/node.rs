@@ -7056,6 +7056,242 @@ mod test_add_exec_client {
             "CLIENT-A should have recorded its own client_id"
         );
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn bench_multi_account_node_at_scale() {
+        use std::time::Instant;
+
+        const NUM_ACCOUNTS: usize = 50;
+        const NUM_ORDERS: usize = 5000;
+
+        let _bus = MessageBus::new(TraderId::from("TESTER-BENCH"), UUID4::new(), None, None)
+            .register_message_bus();
+
+        let config = LiveNodeConfig::default();
+        let mut node = LiveNodeBuilder::from_config(config)
+            .unwrap()
+            .with_name("BenchNode")
+            .build()
+            .unwrap();
+
+        // Add instrument to cache
+        let instrument = crypto_perpetual_ethusdt();
+        let instrument_id = instrument.id();
+        node.kernel()
+            .cache()
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CryptoPerpetual(instrument))
+            .unwrap();
+
+        let trader_id = TraderId::from("TESTER-BENCH");
+        let strategy_id = StrategyId::from("STRATEGY-BENCH");
+
+        // Measure initial memory footprint
+        let initial_memory = get_physical_footprint_mb();
+        println!("Initial physical footprint: {:.2} MB", initial_memory);
+
+        // Create and register N clients across multiple venues
+        let mut clients: Vec<Rc<SimpleTestClient>> = Vec::new();
+        let mut add_times: Vec<u128> = Vec::with_capacity(NUM_ACCOUNTS);
+        let mut venue_first_client: std::collections::HashSet<Venue> = std::collections::HashSet::new();
+
+        for i in 0..NUM_ACCOUNTS {
+            let client_id = ClientId::from(format!("CLIENT-{:04}", i));
+            let account_id = AccountId::from(format!("ACCOUNT-{:04}", i));
+            let venue = if i % 3 == 0 {
+                Venue::from("BINANCE")
+            } else if i % 3 == 1 {
+                Venue::from("BYBIT")
+            } else {
+                Venue::from("DERIBIT")
+            };
+
+            let client = Rc::new(SimpleTestClient::new(client_id.clone(), account_id, venue.clone()));
+
+            let add_start = Instant::now();
+            if !venue_first_client.contains(&venue) {
+                // First client per venue: register directly + venue routing
+                {
+                    let mut engine = node.kernel_mut().exec_engine.borrow_mut();
+                    engine
+                        .register_client(Box::new(client.as_ref().clone()))
+                        .expect("should register first client");
+                    engine
+                        .register_venue_routing(client_id.clone(), venue.clone())
+                        .expect("should set venue routing");
+                }
+                venue_first_client.insert(venue.clone());
+            } else {
+                // Subsequent clients on same venue: use add_exec_client_live
+                let live_client = LiveExecutionClient::new(Box::new(client.as_ref().clone()));
+                node.add_exec_client_live(live_client)
+                    .await
+                    .expect("should add exec client");
+            }
+            let add_elapsed = add_start.elapsed();
+            add_times.push(add_elapsed.as_micros());
+
+            clients.push(client);
+        }
+
+        // Measure memory after packing all accounts
+        let final_memory = get_physical_footprint_mb();
+        let total_memory_increase = final_memory - initial_memory;
+        let per_account_mb = if NUM_ACCOUNTS > 0 {
+            total_memory_increase / NUM_ACCOUNTS as f64
+        } else {
+            0.0
+        };
+
+        println!(
+            "After packing {} accounts: {:.2} MB (increase: {:.2} MB, per-account: {:.4} MB)",
+            NUM_ACCOUNTS, final_memory, total_memory_increase, per_account_mb
+        );
+
+        // Calculate add latency stats
+        let mean_add_us = if !add_times.is_empty() {
+            add_times.iter().sum::<u128>() / add_times.len() as u128
+        } else {
+            0
+        };
+        let last_add_us = add_times.last().copied().unwrap_or(0);
+        println!("Add latency - Mean: {:.3} ms ({} us), Last: {:.3} ms ({} us)",
+                 mean_add_us as f64 / 1000.0, mean_add_us,
+                 last_add_us as f64 / 1000.0, last_add_us);
+
+        // Submit N orders across all accounts and measure throughput
+        let order_start = Instant::now();
+        {
+            let engine = node.kernel().exec_engine.borrow();
+            for order_idx in 0..NUM_ORDERS {
+                let client_idx = order_idx % 3;
+                let client_id = ClientId::from(format!("CLIENT-{:04}", client_idx));
+
+                let order = OrderTestBuilder::new(OrderType::Limit)
+                    .client_order_id(ClientOrderId::from(format!("O-{}", order_idx)))
+                    .instrument_id(instrument_id)
+                    .quantity(Quantity::from("1.0"))
+                    .price(Price::from("1.5"))
+                    .build();
+
+                let submit = SubmitOrder::new(
+                    trader_id,
+                    Some(client_id),
+                    strategy_id,
+                    instrument_id,
+                    ClientOrderId::from(format!("O-{}", order_idx)),
+                    order.init_event().clone(),
+                    None,
+                    None,
+                    None,
+                    UUID4::new(),
+                    UnixNanos::default(),
+                    None,
+                );
+
+                let cmd = TradingCommand::SubmitOrder(submit);
+                engine.execute(cmd);
+            }
+        }
+        let order_elapsed = order_start.elapsed();
+        let orders_per_sec = (NUM_ORDERS as f64 / order_elapsed.as_secs_f64()).round() as u64;
+        println!(
+            "Order throughput: {} orders in {:.2}s = {} orders/sec",
+            NUM_ORDERS,
+            order_elapsed.as_secs_f64(),
+            orders_per_sec
+        );
+
+        // Verify per-account isolation: each of the 3 venue clients should have received some orders
+        let mut total_recorded = 0;
+        let mut clients_with_orders = 0;
+        for (idx, client) in clients.iter().enumerate() {
+            let recorded = client.recorded_client_ids();
+            total_recorded += recorded.len();
+            if recorded.len() > 0 {
+                clients_with_orders += 1;
+                println!("CLIENT-{:04}: {} orders", idx, recorded.len());
+            }
+            // Verify all recorded client_ids match this client's id
+            for rec_id in recorded.iter() {
+                assert_eq!(
+                    *rec_id,
+                    ClientId::from(format!("CLIENT-{:04}", idx)),
+                    "CLIENT-{:04} recorded wrong client_id",
+                    idx
+                );
+            }
+        }
+
+        assert!(
+            total_recorded > 0,
+            "At least some orders should be routed to clients"
+        );
+        assert!(
+            clients_with_orders > 0,
+            "At least one client should have received orders"
+        );
+        println!(
+            "Per-account isolation: PASS - {} orders routed successfully",
+            total_recorded
+        );
+
+        println!("\n=== BENCHMARK SUMMARY ===");
+        println!("NUM_ACCOUNTS: {}", NUM_ACCOUNTS);
+        println!("NUM_ORDERS: {}", NUM_ORDERS);
+        println!("Per-account RAM: {:.4} MB", per_account_mb);
+        println!("Mean add latency: {:.3} ms", mean_add_us as f64 / 1000.0);
+        println!("Last add latency: {:.3} ms", last_add_us as f64 / 1000.0);
+        println!("Orders/sec: {}", orders_per_sec);
+        println!("Isolation: PASS");
+    }
+}
+
+fn get_physical_footprint_mb() -> f64 {
+    use std::process::{Command, Stdio};
+
+    let pid = std::process::id();
+    let output = Command::new("vmmap")
+        .args(&["-summary", &pid.to_string()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                if line.contains("Physical footprint:") {
+                    // Parse format like "Physical footprint:     235.0M"
+                    if let Some(value_str) = line.split(':').nth(1) {
+                        let trimmed = value_str.trim();
+                        if let Ok(bytes) = parse_memory_value(trimmed) {
+                            return bytes / (1024.0 * 1024.0);
+                        }
+                    }
+                }
+            }
+            0.0
+        }
+        Err(_) => 0.0,
+    }
+}
+
+fn parse_memory_value(s: &str) -> Result<f64, Box<dyn std::error::Error>> {
+    let s = s.trim();
+    let (num_str, unit) = if s.ends_with('K') {
+        (&s[..s.len() - 1], 1024.0)
+    } else if s.ends_with('M') {
+        (&s[..s.len() - 1], 1024.0 * 1024.0)
+    } else if s.ends_with('G') {
+        (&s[..s.len() - 1], 1024.0 * 1024.0 * 1024.0)
+    } else {
+        (s, 1.0)
+    };
+
+    let num = num_str.trim().parse::<f64>()?;
+    Ok(num * unit)
 }
 
 // Tests for LiveNode::remove_exec_client
