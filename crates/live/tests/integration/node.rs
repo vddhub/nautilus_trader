@@ -45,7 +45,7 @@ use nautilus_common::{
         ExecutionEvent,
         execution::{
             GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
-            GeneratePositionStatusReports, QueryOrder, TradingCommand,
+            GeneratePositionStatusReports, QueryOrder, SubmitOrder, TradingCommand,
         },
         system::{QueueStateChanged, ShutdownSystem},
     },
@@ -6462,6 +6462,7 @@ mod test_add_exec_client {
         venue: Venue,
         should_fail_connect: Rc<RefCell<bool>>,
         mass_status: Rc<RefCell<Option<ExecutionMassStatus>>>,
+        recorded_client_ids: Rc<RefCell<Vec<ClientId>>>,
     }
 
     impl SimpleTestClient {
@@ -6472,6 +6473,7 @@ mod test_add_exec_client {
                 venue,
                 should_fail_connect: Rc::new(RefCell::new(false)),
                 mass_status: Rc::new(RefCell::new(None)),
+                recorded_client_ids: Rc::new(RefCell::new(Vec::new())),
             }
         }
 
@@ -6484,6 +6486,10 @@ mod test_add_exec_client {
         fn with_mass_status(self, status: ExecutionMassStatus) -> Self {
             *self.mass_status.borrow_mut() = Some(status);
             self
+        }
+
+        pub(super) fn recorded_client_ids(&self) -> Vec<ClientId> {
+            self.recorded_client_ids.borrow().clone()
         }
     }
 
@@ -6622,6 +6628,11 @@ mod test_add_exec_client {
             _ts_event: UnixNanos,
             _params: Option<Params>,
         ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn submit_order(&self, _cmd: nautilus_common::messages::execution::SubmitOrder) -> anyhow::Result<()> {
+            self.recorded_client_ids.borrow_mut().push(self.client_id);
             Ok(())
         }
     }
@@ -6925,44 +6936,125 @@ mod test_add_exec_client {
             .build()
             .unwrap();
 
-        let client_a = SimpleTestClient::new(
+        let client_a = Rc::new(SimpleTestClient::new(
             ClientId::from("CLIENT-A"),
             AccountId::from("ACCOUNT-A"),
-            Venue::from("SIM"),
-        );
+            Venue::from("BINANCE"),
+        ));
 
-        let client_b = SimpleTestClient::new(
+        let client_b = Rc::new(SimpleTestClient::new(
             ClientId::from("CLIENT-B"),
             AccountId::from("ACCOUNT-B"),
-            Venue::from("SIM"), // Same venue as client A
-        );
+            Venue::from("BINANCE"), // Same venue as client A
+        ));
 
         // Register both clients
         {
             let mut engine = node.kernel_mut().exec_engine.borrow_mut();
-            engine.register_client(Box::new(client_a)).expect("should register client A");
-            engine.register_venue_routing(ClientId::from("CLIENT-A"), Venue::from("SIM"))
-                .expect("should set venue routing for SIM");
+            engine.register_client(Box::new(client_a.as_ref().clone())).expect("should register client A");
+            engine.register_venue_routing(ClientId::from("CLIENT-A"), Venue::from("BINANCE"))
+                .expect("should set venue routing for BINANCE");
         }
 
-        let live_client_b = LiveExecutionClient::new(Box::new(client_b));
+        let live_client_b = LiveExecutionClient::new(Box::new(client_b.as_ref().clone()));
         node.add_exec_client_live(live_client_b).await
             .expect("should add client B on same venue");
 
-        // Verify both clients are registered and resolvable by explicit client_id
-        let engine = node.kernel().exec_engine.borrow();
+        // Add instrument to cache so routing can proceed
+        let instrument = crypto_perpetual_ethusdt();
+        let instrument_id = instrument.id();
+        node.kernel()
+            .cache()
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CryptoPerpetual(instrument))
+            .unwrap();
 
-        // Both clients should be resolvable by explicit client_id
-        let client_a_explicit = engine.get_client(&ClientId::from("CLIENT-A"));
-        assert!(client_a_explicit.is_some(), "CLIENT-A should be resolvable");
+        let trader_id = TraderId::from("TESTER-012");
+        let strategy_id = StrategyId::from("STRATEGY-001");
 
-        let client_b_explicit = engine.get_client(&ClientId::from("CLIENT-B"));
-        assert!(client_b_explicit.is_some(), "CLIENT-B should be resolvable");
+        // Test 1: Send command with explicit client_id = B → should route to B
+        {
+            let engine = node.kernel().exec_engine.borrow();
 
-        // Verify routing map points to A for SIM (default/first)
-        let all_client_ids = engine.client_ids();
-        assert!(all_client_ids.contains(&ClientId::from("CLIENT-A")), "CLIENT-A should be in client list");
-        assert!(all_client_ids.contains(&ClientId::from("CLIENT-B")), "CLIENT-B should be in client list");
+            // Create a test order
+            let order = OrderTestBuilder::new(OrderType::Limit)
+                .client_order_id(ClientOrderId::from("O-1"))
+                .instrument_id(instrument_id)
+                .quantity(Quantity::from("1.0"))
+                .price(Price::from("1.5"))
+                .build();
+
+            let submit_with_explicit_b = SubmitOrder::new(
+                trader_id,
+                Some(ClientId::from("CLIENT-B")),
+                strategy_id,
+                instrument_id,
+                ClientOrderId::from("O-1"),
+                order.init_event().clone(),
+                None,
+                None,
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+            );
+
+            let cmd = TradingCommand::SubmitOrder(submit_with_explicit_b);
+            engine.execute(cmd);
+        }
+
+        // Test 2: Send command with NO explicit client_id → should route to A (default/first)
+        {
+            let engine = node.kernel().exec_engine.borrow();
+
+            let order = OrderTestBuilder::new(OrderType::Limit)
+                .client_order_id(ClientOrderId::from("O-2"))
+                .instrument_id(instrument_id)
+                .quantity(Quantity::from("1.0"))
+                .price(Price::from("1.5"))
+                .build();
+
+            let submit_no_explicit_id = SubmitOrder::new(
+                trader_id,
+                None, // No explicit client_id → should route to default (A)
+                strategy_id,
+                instrument_id,
+                ClientOrderId::from("O-2"),
+                order.init_event().clone(),
+                None,
+                None,
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+            );
+
+            let cmd = TradingCommand::SubmitOrder(submit_no_explicit_id);
+            engine.execute(cmd);
+        }
+
+        // Verify routing: client_b should have received 1 command, client_a should have received 1
+        assert_eq!(
+            client_b.recorded_client_ids().len(),
+            1,
+            "CLIENT-B should have received exactly 1 command (explicit routing)"
+        );
+        assert_eq!(
+            client_b.recorded_client_ids()[0],
+            ClientId::from("CLIENT-B"),
+            "CLIENT-B should have recorded its own client_id"
+        );
+
+        assert_eq!(
+            client_a.recorded_client_ids().len(),
+            1,
+            "CLIENT-A should have received exactly 1 command (default routing)"
+        );
+        assert_eq!(
+            client_a.recorded_client_ids()[0],
+            ClientId::from("CLIENT-A"),
+            "CLIENT-A should have recorded its own client_id"
+        );
     }
 }
 
