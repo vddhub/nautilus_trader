@@ -50,10 +50,10 @@ flowchart TB
 ```
 
 Key points:
-- **One `NautilusKernel` per node**, single-threaded event loop. ~131 MB fixed/node; bots ≈ tens of KB each → pack many bots + accounts per node.
+- **One `NautilusKernel` per node**, single-threaded event loop. ~45 MB fixed/node on 2.0 (was ~131 MB on 1.x); bots ≈ tens of KB each, ~0.16 MB marginal/packed account (mock) → pack many bots + accounts per node.
 - **Shared**: host, Redis (logical isolation by `trader_id` key prefix), market-data feed (one public WS/venue, fanned out via Redis `external_streams`).
 - **Per-tenant**: exec client + venue API creds (2+ accounts per venue allowed as of v2, routed by explicit `client_id`), strategy/bot state.
-- **Runtime lifecycle** (this feature): control plane calls `py_add_exec_client_live(factory, config)` / `py_remove_exec_client(client_id)`; the call enqueues an `ExecClientCommand` on the live-crate channel and **blocks on a oneshot reply** so the real success/failure (incl. connect/reconcile/duplicate-venue) comes back synchronously.
+- **Runtime lifecycle** (this feature): control plane calls `add_exec_client_live_async` / `remove_exec_client_async` (preferred, awaited on the node loop) or the blocking `py_add_exec_client_live` / `py_remove_exec_client`; the call enqueues an `ExecClientCommand` on the live-crate channel and **waits on a oneshot reply** so the real success/failure (incl. connect/reconcile/duplicate-client_id) comes back to the caller.
 
 ## 2. Runtime add/remove data flow (the feature)
 
@@ -69,11 +69,11 @@ sequenceDiagram
   CP->>PB: py_add_exec_client_live(factory, config)
   PB->>PB: build LiveExecutionClient (factory.create + kernel state)
   PB->>CH: send ExecClientCommand::Add(client, reply_tx)
-  PB->>PB: py.allow_threads(reply_rx.blocking_recv())  %% GIL released, waits
+  PB->>PB: await (future_into_py) OR py.detach(reply_rx.blocking_recv())  %% GIL released, waits
   CH->>EL: dequeued on loop thread
   EL->>EE: add_exec_client_live(client)
-  EE->>EE: venue guard (one acct/venue) — reject if dup
-  EE->>EE: register_client + venue routing
+  EE->>EE: reject only if client_id already registered
+  EE->>EE: register_client + venue routing (first client on venue only; 2nd+ addressed by client_id)
   EE->>VEN: connect_client (private WS/REST)
   EE->>VEN: request mass status
   VEN-->>EE: orders/positions/balances
@@ -81,7 +81,7 @@ sequenceDiagram
   EE-->>EL: Result
   EL-->>CH: reply_tx.send(Result)
   CH-->>PB: blocking_recv returns
-  PB-->>CP: Ok(())  OR  raise (duplicate venue / connect / reconcile error)
+  PB-->>CP: Ok(())  OR  raise (duplicate client_id / connect / reconcile error)
 ```
 
 Remove mirrors this: `Remove(client_id, reply_tx)` → disconnect → deregister → drop from `exec_clients` (orders/positions left in cache as-is) → reply.
@@ -95,7 +95,7 @@ flowchart LR
   FRED -->|external_streams ingest| DE["Tenant node DataEngine"]
   DE -->|"on_quote/on_bar"| BOT["bot A / bot B (strategies)"]
   BOT -->|submit_order client_id=TENANT-A| EE["ExecutionEngine"]
-  EE -->|route by venue→client| ECA["ExecClient TENANT-A"]
+  EE -->|route by explicit client_id<br/>(venue default if omitted)| ECA["ExecClient TENANT-A"]
   ECA -->|private WS/REST| VEN2["Exchange (account A)"]
   VEN2 -->|fills/events| ECA --> PF["Portfolio + Cache"]
 ```
