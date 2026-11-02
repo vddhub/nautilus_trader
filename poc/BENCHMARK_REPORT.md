@@ -8,7 +8,8 @@
 Runtime add/remove of execution clients (one tenant account each) on a **running** `LiveNode`,
 driven in-process from Python with **no venue creds** (Sandbox mock). End-to-end demo green:
 add → reconciled; duplicate-venue → rejected (error surfaced to caller); remove → leaves
-orders/positions; clean shutdown. Verified at Rust level too (11 integration tests).
+orders/positions; clean shutdown. Verified at Rust level too (integration tests, incl. 2
+same-venue per-account isolation tests + a 50-account scale bench).
 
 ## Numbers (in-process, sandbox venue)
 | Metric | Value |
@@ -30,21 +31,24 @@ orders/positions; clean shutdown. Verified at Rust level too (11 integration tes
 - **Process-per-tenant** (one node each): 12.5 GB / 45 MB ≈ **~275 nodes** (more in practice —
   the Python interpreter + `.so` are shared copy-on-write across same-host processes).
 - **Packed, one node + many accounts** (the feature's point; needs distinct client_ids = real
-  adapters): 45 MB + 1.9 MB × N → RAM allows **thousands of accounts** in one node. RAM stops
-  being the limit; the binding constraints become per-node single-thread CPU, venue connections,
-  and API rate limits — not memory.
+  adapters): measured marginal is **~0.16 MB/account** (e2e section, mock) → RAM allows
+  **thousands of accounts** in one node. RAM stops being the limit; the binding constraints become
+  per-node single-thread CPU (~73k orders/sec mock ceiling), venue connections, and API rate
+  limits — not memory. Real adapters (private WS + buffers) raise the per-account floor; still RAM
+  is not the ceiling.
 - Runtime add/remove at **~ms latency** → tenant accounts can be spun in/out dynamically
   (scale-to-zero idle tenants, blue-green, on-demand onboarding) without node restarts.
 
 ## Caveats
 1. Sandbox mock node is lighter than a live node with real market-data feeds + a Redis/Postgres
    cache backing; a production live node will be heavier than 45 MB (budget 2–4×).
-2. **Per-account packing not directly measured here**: `SandboxExecutionClientFactory.name()` is
-   fixed ("SANDBOX") → client_id collides, so only one sandbox account fits per node. The +1.9 MB
-   is the single-account delta; real adapters (distinct client_ids) are needed to measure N-per-node.
+2. The **+1.9 MB** here is the *first* sandbox account's delta (includes one-time per-client fixed
+   cost); the Python sandbox path fits only one account per node (`SandboxExecutionClientFactory.name()`
+   is fixed "SANDBOX" → client_id collides). N-per-node packing is measured in the e2e section below
+   (50 distinct mock client_ids) — **marginal ~0.16 MB/account**, far below this first-account delta.
 3. Numbers are `vmmap` physical footprint on macOS; Linux/containers differ modestly.
-4. The feature is a branch build; the Python async binding + capture-before-run + sim-factory
-   fallback are uncommitted (`crates/live/Cargo.toml`, `crates/live/src/python/node.rs`).
+4. The feature is a branch build; all of it is committed (async binding + capture-before-run +
+   sim-factory fallback in `4e23e19d17`). Not yet merged to `develop` / upstreamed.
 
 ## Bottom line
 The original goal — a shareable trade-engine serving many tenants cheaply — is far more
