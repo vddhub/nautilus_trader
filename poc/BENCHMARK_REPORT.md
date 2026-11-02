@@ -52,10 +52,12 @@ same-venue per-account isolation tests + a 50-account scale bench).
 
 ## Bottom line
 The original goal — a shareable trade-engine serving many tenants cheaply — is far more
-reachable on 2.0 than the 1.x analysis suggested: **~3× lower per-node RAM, ~2 MB per added
-account, millisecond runtime add/remove.** Density is now limited by CPU/connections/rate-limits,
+reachable on 2.0 than the 1.x analysis suggested: **~3× lower per-node RAM (~131 MB → ~45 MB),
+~0.16 MB marginal per packed account (mock, e2e), millisecond runtime add/remove.** Density is
+limited by CPU (~73k orders/sec single-thread mock ceiling), venue connections, and rate-limits —
 not memory. The runtime add/remove feature removes the "rebuild the node per new tenant account"
-blocker entirely.
+blocker entirely. Open: real-venue validation (per-account adapter RAM, real connect/reconcile
+latency, real CPU ceiling) — all unmeasured while mocked.
 
 ## E2E benchmark — packing + throughput at scale (mocked venue)
 
