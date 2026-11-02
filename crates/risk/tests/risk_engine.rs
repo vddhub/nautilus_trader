@@ -16864,3 +16864,151 @@ impl EmulatedExecution {
         assert!(trading_cmd_queue_is_empty());
     }
 }
+
+// Per-account isolation tests: verify that orders are checked against their own account's balance
+// and that ambiguous venue fallback properly fails-closed with 2+ accounts.
+
+#[rstest]
+#[case::bravo_poor_account(Some("BRAVO"), Some(POOR_ACCOUNT_BUY_DENIAL))]
+#[case::alpha_rich_account(Some("ALPHA"), None)]
+fn test_pretrade_isolates_same_venue_accounts(
+    #[case] client_id: Option<&str>,
+    #[case] denial: Option<&str>,
+    instrument_audusd: InstrumentAny,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    execute_order_event_handler: TypedIntoMessageSavingHandler<TradingCommand>,
+) {
+    // Setup: two accounts (SIM-001: $1M, SIM-002: $500) on same venue SIM via different clients
+    let mut cache = sim_accounts_cache(&instrument_audusd);
+
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_audusd.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(1000))
+        .price(Price::from("1.00000"))
+        .build();
+    cache.add_order(order.clone(), None, None, false).unwrap();
+
+    // Multi-client setup: ALPHA → SIM-001 (rich), BRAVO → SIM-002 (poor)
+    let clients = &[
+        ("ALPHA", "SIM-001", "SIM"),
+        ("BRAVO", "SIM-002", "SIM"),
+    ];
+    let mut risk_engine = risk_engine_with_clients(cache, clients, None, None);
+
+    let command = SubmitOrder::from_order(
+        &order,
+        order.trader_id(),
+        client_id.map(ClientId::from),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    risk_engine.execute(TradingCommand::SubmitOrder(command.clone()));
+
+    assert_submit_result(
+        &process_order_event_handler,
+        &execute_order_event_handler,
+        &order,
+        TradingCommand::SubmitOrder(command),
+        denial,
+    );
+}
+
+#[rstest]
+fn test_pretrade_ambiguous_venue_no_client_rejected(
+    instrument_audusd: InstrumentAny,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+) {
+    // Setup: two accounts on same venue, order with NO explicit client → fail-closed
+    let mut cache = sim_accounts_cache(&instrument_audusd);
+    cache
+        .add_account(cash_account_usd("SIM-002", "1000000 USD"))
+        .unwrap();
+
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_audusd.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(1000))
+        .price(Price::from("1.00000"))
+        .build();
+    cache.add_order(order.clone(), None, None, false).unwrap();
+
+    let clients = &[
+        ("ALPHA", "SIM-001", "SIM"),
+        ("BRAVO", "SIM-002", "SIM"),
+    ];
+
+    let mut risk_engine = risk_engine_with_clients(cache, clients, None, None);
+
+    // Order with NO client_id → venue fallback should resolve to None (2+ accounts ambiguous)
+    let command = SubmitOrder::from_order(
+        &order,
+        order.trader_id(),
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    risk_engine.execute(TradingCommand::SubmitOrder(command.clone()));
+
+    let events = get_process_order_event_handler_messages(&process_order_event_handler);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type(), OrderEventType::Denied);
+    assert_eq!(events[0].client_order_id(), order.client_order_id());
+    // Should fail because no account could be resolved (ambiguous)
+    assert!(events[0].message().unwrap().contains("VALIDATION_FAILED"));
+}
+
+#[rstest]
+#[case::external_client_no_balance_check(Some("EXTERNAL"), None)]
+fn test_external_client_order_skips_inhouse_risk(
+    #[case] client_id: Option<&str>,
+    #[case] denial: Option<&str>,
+    instrument_audusd: InstrumentAny,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    execute_order_event_handler: TypedIntoMessageSavingHandler<TradingCommand>,
+) {
+    // External client order → resolves to None → skips in-house risk checks
+    // even with insufficient account balance
+    let mut cache = Cache::default();
+    cache.add_instrument(instrument_audusd.clone()).unwrap();
+    cache
+        .add_account(cash_account_usd("SIM-001", "1000000 USD"))
+        .unwrap();
+    cache
+        .add_account(cash_account_usd("LOCAL-001", "500 USD"))
+        .unwrap();
+
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_audusd.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(1000))
+        .price(Price::from("1.00000"))
+        .build();
+    cache.add_order(order.clone(), None, None, false).unwrap();
+
+    // Register EXTERNAL client with poor balance account
+    let mut risk_engine = risk_engine_with_clients(cache, &[("LOCAL", "LOCAL-001", "LOCAL")], None, Some("LOCAL"));
+
+    let command = SubmitOrder::from_order(
+        &order,
+        order.trader_id(),
+        client_id.map(ClientId::from),
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+    );
+
+    risk_engine.execute(TradingCommand::SubmitOrder(command.clone()));
+
+    assert_submit_result(
+        &process_order_event_handler,
+        &execute_order_event_handler,
+        &order,
+        TradingCommand::SubmitOrder(command),
+        denial,
+    );
+}
