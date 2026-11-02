@@ -12938,3 +12938,160 @@ fn test_margin_option_equity_converts_and_carries_exchange_rate(
         IndexMap::from([(Currency::EUR(), Money::from("10090 EUR"))])
     );
 }
+
+#[rstest]
+fn test_portfolio_reads_isolate_same_venue_accounts() {
+    let venue = Venue::from("BINANCE");
+    let account_a = AccountId::from("BINANCE-001");
+    let account_b = AccountId::from("BINANCE-002");
+    let instrument_id = InstrumentId::from("BTCUSDT.BINANCE");
+    let instrument = InstrumentAny::CryptoPerpetual(btcusd_bybit());
+
+    let mut cache = Cache::new(None, None);
+    cache.add_instrument(instrument.clone()).unwrap();
+
+    let clock = VirtualClock::new();
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(clock)),
+        Rc::new(RefCell::new(cache)),
+        None,
+    );
+
+    let state_a = margin_account_state_with_reservations(
+        account_a,
+        instrument_id,
+        "100 USD",
+        "30 USD",
+        "15 USD",
+    );
+    let state_b = margin_account_state_with_reservations(
+        account_b,
+        instrument_id,
+        "250 USD",
+        "70 USD",
+        "35 USD",
+    );
+
+    portfolio.update_account(&state_a);
+    portfolio.update_account(&state_b);
+
+    let balances_a = portfolio.balances_locked(&venue, Some(&account_a));
+    let balances_b = portfolio.balances_locked(&venue, Some(&account_b));
+
+    let margins_initial_a = portfolio.instrument_initial_margins(&venue, Some(&account_a));
+    let margins_initial_b = portfolio.instrument_initial_margins(&venue, Some(&account_b));
+
+    let margins_maintenance_a = portfolio.instrument_maintenance_margins(&venue, Some(&account_a));
+    let margins_maintenance_b = portfolio.instrument_maintenance_margins(&venue, Some(&account_b));
+
+    assert_eq!(
+        balances_a,
+        IndexMap::from([(Currency::USD(), Money::from("100 USD"))])
+    );
+    assert_eq!(
+        balances_b,
+        IndexMap::from([(Currency::USD(), Money::from("250 USD"))])
+    );
+
+    assert_eq!(
+        margins_initial_a,
+        IndexMap::from([(instrument_id, Money::from("30 USD"))])
+    );
+    assert_eq!(
+        margins_initial_b,
+        IndexMap::from([(instrument_id, Money::from("70 USD"))])
+    );
+
+    assert_eq!(
+        margins_maintenance_a,
+        IndexMap::from([(instrument_id, Money::from("15 USD"))])
+    );
+    assert_eq!(
+        margins_maintenance_b,
+        IndexMap::from([(instrument_id, Money::from("35 USD"))])
+    );
+}
+
+#[rstest]
+fn test_venue_read_without_account_is_empty_when_ambiguous() {
+    let venue = Venue::from("BINANCE");
+    let account_a = AccountId::from("BINANCE-001");
+    let account_b = AccountId::from("BINANCE-002");
+    let instrument_id = InstrumentId::from("BTCUSDT.BINANCE");
+
+    let cache = Cache::new(None, None);
+    let clock = VirtualClock::new();
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(clock)),
+        Rc::new(RefCell::new(cache)),
+        None,
+    );
+
+    let state_a = margin_account_state_with_reservations(
+        account_a,
+        instrument_id,
+        "100 USD",
+        "30 USD",
+        "15 USD",
+    );
+    let state_b = margin_account_state_with_reservations(
+        account_b,
+        instrument_id,
+        "250 USD",
+        "70 USD",
+        "35 USD",
+    );
+
+    portfolio.update_account(&state_a);
+    portfolio.update_account(&state_b);
+
+    let balances_no_account = portfolio.balances_locked(&venue, None);
+    let margins_initial_no_account = portfolio.instrument_initial_margins(&venue, None);
+    let margins_maintenance_no_account = portfolio.instrument_maintenance_margins(&venue, None);
+
+    assert_eq!(balances_no_account, IndexMap::new());
+    assert_eq!(margins_initial_no_account, IndexMap::new());
+    assert_eq!(margins_maintenance_no_account, IndexMap::new());
+}
+
+#[rstest]
+fn test_single_account_venue_read_still_resolves() {
+    let venue = Venue::from("BINANCE");
+    let account_a = AccountId::from("BINANCE-001");
+    let instrument_id = InstrumentId::from("BTCUSDT.BINANCE");
+
+    let cache = Cache::new(None, None);
+    let clock = VirtualClock::new();
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(clock)),
+        Rc::new(RefCell::new(cache)),
+        None,
+    );
+
+    let state_a = margin_account_state_with_reservations(
+        account_a,
+        instrument_id,
+        "100 USD",
+        "30 USD",
+        "15 USD",
+    );
+
+    portfolio.update_account(&state_a);
+
+    let balances_no_account = portfolio.balances_locked(&venue, None);
+    let margins_initial_no_account = portfolio.instrument_initial_margins(&venue, None);
+    let margins_maintenance_no_account = portfolio.instrument_maintenance_margins(&venue, None);
+
+    assert_eq!(
+        balances_no_account,
+        IndexMap::from([(Currency::USD(), Money::from("100 USD"))])
+    );
+    assert_eq!(
+        margins_initial_no_account,
+        IndexMap::from([(instrument_id, Money::from("30 USD"))])
+    );
+    assert_eq!(
+        margins_maintenance_no_account,
+        IndexMap::from([(instrument_id, Money::from("15 USD"))])
+    );
+}
