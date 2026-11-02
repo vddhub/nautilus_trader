@@ -15,6 +15,7 @@ Branch: `feature/runtime-multi-account-node`. Design: `docs/superpowers/specs/20
 | `bench_runtime.py` | runtime feature benchmark: node footprint, per-account delta, add/remove latency (macOS) |
 | `BLOCKERS.md` | what runs today, what shipped (v1+v2), and what's left for production |
 | `BENCHMARK_REPORT.md` | resource/latency numbers for the runtime multi-account feature |
+| `INTEGRATOR_GUIDE.md` | **consumer/API reference** — build+run a node, add/remove accounts at runtime, per-account rules |
 
 ## Run the shared-feed demo (today, released wheel)
 ```
