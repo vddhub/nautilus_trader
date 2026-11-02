@@ -52,3 +52,34 @@ reachable on 2.0 than the 1.x analysis suggested: **~3× lower per-node RAM, ~2 
 account, millisecond runtime add/remove.** Density is now limited by CPU/connections/rate-limits,
 not memory. The runtime add/remove feature removes the "rebuild the node per new tenant account"
 blocker entirely.
+
+## E2E benchmark — packing + throughput at scale (mocked venue)
+
+`crates/live/tests/integration/node.rs::bench_multi_account_node_at_scale` (run:
+`cargo test -p nautilus-live --test integration -- --ignored --nocapture`). Packs N distinct
+mock accounts into ONE node and routes M orders by explicit `client_id`. Mock = `SimpleTestClient`
+(no venue creds, no network). Controller-verified run (N=50, M=5000):
+
+| Metric | Value |
+|---|---|
+| Base node footprint | 72.5 MB |
+| After packing 50 accounts | 80.4 MB |
+| **Per-account marginal RAM** | **~0.16 MB/account** (+7.9 MB / 50; noisy — vmmap/allocator variance, a mock-client floor) |
+| **Add latency at scale** (50 already packed) | **~4 µs mean, 3 µs last** |
+| **Order throughput** (route + pre-trade risk, single thread) | **~73,000 orders/sec** |
+| **Per-account isolation under load** | **PASS** — every order reached only its own account, no leakage |
+
+### Reading these numbers
+- **Packing RAM** (~0.16 MB/account, mock) means thousands of accounts fit per node RAM-wise;
+  a real adapter (private WS + buffers) will be heavier per account — treat 0.16 MB as a floor.
+- **Add latency** is microseconds for the in-memory mock; a real venue add is I/O-bound
+  (connect + reconcile), seconds — this number isolates the engine-side cost only.
+- **73k orders/sec** is the single-thread routing+risk ceiling with mock clients (no network).
+  It's an upper bound: real venue submit does network I/O, so effective per-node order rate is
+  lower and bounded by the slowest tenant's handler (the single event loop is shared).
+- **Isolation holds under concurrent multi-account load.**
+
+### What this still does NOT cover (needs real venue, out of scope while mocked)
+- Real connect/reconcile latency + venue rate limits.
+- Real per-account memory (adapter WS/state) and real order-flow CPU (serialization, acks).
+- The real single-thread ceiling under realistic per-tenant strategy CPU.
