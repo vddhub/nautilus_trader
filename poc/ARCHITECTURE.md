@@ -6,27 +6,23 @@ Target: many tenants (each their own exchange account) sharing host + infra, wit
 
 ## 1. High-level components
 
-This is a **topology** view (what lives where). The detailed data/order/fill flow is in §3.
+This is a **topology** view (what lives where). All boxes below the control plane share **one
+host (16 GB)**. Detailed data/order/fill flow is in §3.
 
 ```mermaid
 flowchart TB
-  subgraph CP["Control plane (your service)"]
-    API["REST / queue API<br/>tenant lifecycle + desired state"]
-    DB[("control DB<br/>tenants, accounts, desired state")]
-  end
-
-  subgraph HOST["One host (16 GB) — shared"]
-    FEED["Feed node (1 per venue, data-only)<br/>DataClient — public WS"]
-    subgraph NODE["Tenant node — LiveNode / NautilusKernel<br/>single-thread event loop"]
-      KERNEL["DataEngine · RiskEngine · ExecutionEngine<br/>Portfolio · Cache"]
-      EC1["ExecClient: TENANT-A acct"]
-      EC2["ExecClient: TENANT-B acct"]
-      BOTS["Strategies / Actors: bot A, bot B"]
-    end
-    RED[("Redis<br/>cache + msgbus streams<br/>key: trader-{id}")]
-  end
-
+  API["Control plane: REST / queue API<br/>tenant lifecycle + desired state"]
+  DB[("control DB<br/>tenants, accounts, desired state")]
+  FEED["Feed node (1 per venue, data-only)<br/>DataClient — public WS"]
+  RED[("Redis — shared<br/>cache + msgbus streams<br/>key: trader-{id}")]
   VEN["Exchanges (Binance/Bybit/…)<br/>public data + private per-account"]
+
+  subgraph NODE["Tenant node — LiveNode / NautilusKernel · single-thread loop · ~45 MB"]
+    KERNEL["DataEngine · RiskEngine · ExecutionEngine<br/>Portfolio · Cache"]
+    BOTS["Strategies / Actors: bot A, bot B"]
+    EC1["ExecClient: TENANT-A acct"]
+    EC2["ExecClient: TENANT-B acct"]
+  end
 
   API -->|"add/remove exec client (lifecycle)"| KERNEL
   API -.- DB
