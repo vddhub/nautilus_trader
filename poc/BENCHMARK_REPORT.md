@@ -58,7 +58,9 @@ blocker entirely.
 `crates/live/tests/integration/node.rs::bench_multi_account_node_at_scale` (run:
 `cargo test -p nautilus-live --test integration -- --ignored --nocapture`). Packs N distinct
 mock accounts into ONE node and routes M orders by explicit `client_id`. Mock = `SimpleTestClient`
-(no venue creds, no network). Controller-verified run (N=50, M=5000):
+(no venue creds, no network). Controller-verified run (N=50, M=5000). Base footprint here (72.5 MB)
+is higher than the Python sandbox run above (45.2 MB) because this is a Rust test-binary process
+(test deps + tokio), a different process — not a regression; read the *marginal* numbers:
 
 | Metric | Value |
 |---|---|
