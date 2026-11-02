@@ -1,5 +1,10 @@
 # Local spin-up blockers
 
+> **STATUS (2026-11-02):** runtime add/remove + v2 per-account isolation are **shipped and
+> committed** on the branch — current state is **UPDATE 5** (bottom). Sections 1–7 and
+> UPDATEs 1–4 are the historical blocker log (all resolved); where they say code is
+> "uncommitted" or show v1 error text, read UPDATE 5 as authoritative.
+
 ## What runs today (released wheel, `docker compose up`)
 - Redis + 1 feed node + N tenant nodes, tenants ingesting the feed's Redis stream
   via `external_streams`. Proves: shared infra, `trader_id` key isolation, one
@@ -163,7 +168,7 @@ binding work is in the working tree (uncommitted): `crates/live/Cargo.toml`,
 (Sandbox) venue:
 ```
 >> add_exec_client_live_async(SIM) ...     OK — added + reconciled
->> duplicate add (same venue) ...          OK — raised: "Venue SIM already has a registered account (SANDBOX) ..."
+>> duplicate add (same venue) ...          OK — raised (v1-era text; v2 now raises "Client already registered with ID SANDBOX")
 >> remove_exec_client_async(SANDBOX) ...    OK — removed (orders/positions left as-is)
 >> done
 ```
@@ -216,8 +221,10 @@ lift + explicit-id preference instead.
 2. **Control-plane sync** (design §8) — order/position/balance → durable event log → DB.
 3. **Real venue validation** — only sandbox mock exercised; no testnet exec (connect, reconcile,
    rate limits).
-4. **Scale/CPU ceiling** — per-account RAM is ~2 MB, but the single-thread CPU limit per node is
-   unmeasured; needs real adapters (distinct client_ids) to find the density cap.
+4. **Scale/CPU ceiling (real venue)** — mock e2e measured ~0.16 MB marginal/account and a
+   ~73k orders/sec single-thread routing+risk ceiling (50 accounts, `SimpleTestClient`). Real
+   adapters (private WS/state + network I/O) raise per-account RAM and lower effective throughput;
+   the real density cap needs testnet exec to measure.
 5. **Delivery** — branch is a fork off `2.0.0rc9`, unpushed; needs `make format`/`pre-commit`/
    `pre-flight` + CI in a proper env, a fork-vs-upstream-PR decision, then push/PR.
 6. **sim-factory fallback** (added for the demo so Sandbox drives the runtime path) — decide if it
