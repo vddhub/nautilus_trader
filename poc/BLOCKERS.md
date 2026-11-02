@@ -187,3 +187,38 @@ rustup component add llvm-tools   # (or) build with strip+warnings overrides bel
 cd python && CARGO_PROFILE_DEV_STRIP=false CARGO_BUILD_WARNINGS=allow CARGO_BUILD_JOBS=8 \
   PATH="<rust-1.99.1-toolchain>/bin:$PATH" uv run --no-sync maturin develop
 ```
+
+## UPDATE 5 — v2 per-account isolation SHIPPED (2026-11-02)
+
+The v1 one-account-per-venue constraint is **lifted**. Two+ accounts on the same venue in one
+node are now fully isolated:
+- One-per-venue guard removed; venue routing registered only for the FIRST client on a venue;
+  additional same-venue accounts are addressed by explicit `client_id` per order.
+- RiskEngine pre-trade + Portfolio reads resolve per `account_id`/`client_id`; the venue→account
+  fallback is KEPT but is fail-closed (single account, or `None` when 2+ — never a wrong account).
+- New uniqueness constraint is `client_id` (adding a duplicate client_id still errors
+  "Client already registered with ID …"; venue is no longer the blocker).
+- Proven by tests: risk 1358, portfolio 339, execution 4230, live feature tests — all green;
+  in-process demo re-verified after rebuild.
+
+Commits: `74b6057f66..e37fc8e8e6`. Design: `docs/superpowers/specs/2026-11-02-per-account-isolation-design.md`.
+NOTE: the design's original "remove venue fallbacks entirely" was reverted — it broke 795
+single-account tests and the fallback is fail-closed/safe; isolation is achieved by the guard
+lift + explicit-id preference instead.
+
+### What's DONE
+- Runtime add/remove exec clients on a live node (Rust + Python async binding).
+- Per-account isolation (2+ accounts/venue), in-node pre-trade enforcement + reporting.
+
+### What's LEFT for production
+1. **External account-risk + kill switch** (design §7) — out-of-process per-account gate +
+   flatten/block, independent of the node. Biggest remaining.
+2. **Control-plane sync** (design §8) — order/position/balance → durable event log → DB.
+3. **Real venue validation** — only sandbox mock exercised; no testnet exec (connect, reconcile,
+   rate limits).
+4. **Scale/CPU ceiling** — per-account RAM is ~2 MB, but the single-thread CPU limit per node is
+   unmeasured; needs real adapters (distinct client_ids) to find the density cap.
+5. **Delivery** — branch is a fork off `2.0.0rc9`, unpushed; needs `make format`/`pre-commit`/
+   `pre-flight` + CI in a proper env, a fork-vs-upstream-PR decision, then push/PR.
+6. **sim-factory fallback** (added for the demo so Sandbox drives the runtime path) — decide if it
+   stays for production or is demo-only; mixing simulated + live clients in one node isn't a real pattern.
