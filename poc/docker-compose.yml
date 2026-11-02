@@ -1,0 +1,45 @@
+# Shared-feed multi-tenant POC — runnable TODAY on the released wheel (1.231.0).
+#   docker compose -f poc/docker-compose.yml up --build
+# Spins up Redis + 1 feed node + 3 tenant nodes. Tenants ingest the feed node's
+# Redis stream via external_streams (one public data connection, fanned out).
+#
+# NOTE: this demonstrates the SHARED-FEED + packing pattern. It does NOT exercise
+# runtime exec-client add/remove (py_add_exec_client_live) — that needs a wheel
+# built from feature/runtime-multi-account-node. See BLOCKERS.md.
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  feed:
+    build: .
+    environment: { REDIS_HOST: redis }
+    command: ["python", "-u", "feed.py", "FEED-001", "demo"]
+    depends_on:
+      redis: { condition: service_healthy }
+
+  tenant-a:
+    build: .
+    environment: { REDIS_HOST: redis }
+    # args: trader_id  streams_prefix  external_stream(feed key)
+    command: ["python", "-u", "tenant.py", "TEN-A-001", "tenA", "trader-FEED-001:demo"]
+    depends_on: [feed]
+
+  tenant-b:
+    build: .
+    environment: { REDIS_HOST: redis }
+    command: ["python", "-u", "tenant.py", "TEN-B-001", "tenB", "trader-FEED-001:demo"]
+    depends_on: [feed]
+
+  tenant-c:
+    build: .
+    environment: { REDIS_HOST: redis }
+    command: ["python", "-u", "tenant.py", "TEN-C-001", "tenC", "trader-FEED-001:demo"]
+    depends_on: [feed]
