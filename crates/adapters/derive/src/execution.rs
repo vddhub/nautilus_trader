@@ -25,6 +25,7 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
+    future::Future,
     rc::Rc,
     sync::{
         Arc,
@@ -40,7 +41,7 @@ use async_trait::async_trait;
 use indexmap::IndexMap;
 use nautilus_common::{
     cache::ORDER_NOT_FOUND,
-    clients::ExecutionClient,
+    clients::{ExecutionClient, ExecutionReportTask},
     enums::LogLevel,
     live::{
         dst::time::{self, Instant},
@@ -548,7 +549,75 @@ impl DeriveExecutionClient {
             instruments: Arc::clone(&self.instruments),
             orders,
             terminal_revision,
+            report_observations: None,
         }
+    }
+
+    fn report_task<T, F, C, M>(
+        &self,
+        instrument_id: Option<InstrumentId>,
+        collect: F,
+        finish: M,
+    ) -> Option<ExecutionReportTask<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(DeriveReconciliationContext) -> C,
+        C: Future<Output = anyhow::Result<T>> + Send + 'static,
+        M: FnOnce(T, &DeriveReconciliationContext) -> anyhow::Result<T> + 'static,
+    {
+        let _delivery = self.dispatch_state.delivery_guard();
+
+        // Resolving a pending replacement can emit events, so retain the inline path
+        if self
+            .dispatch_state
+            .unresolved_client_order_id(instrument_id)
+            .is_some()
+        {
+            return None;
+        }
+
+        let core = self.core.clone();
+        let mut context = self.reconciliation_context();
+        let orders = std::mem::take(&mut context.orders);
+
+        let mut collection = DeriveReconciliationContext {
+            orders,
+            ..context.clone()
+        };
+
+        let observations = Arc::new(Mutex::new(ReportObservations::default()));
+        collection.report_observations = Some(Arc::clone(&observations));
+
+        Some(ExecutionReportTask::new(
+            collect(collection),
+            move |reports| {
+                let dispatch_state = Arc::clone(&context.dispatch_state);
+                let _delivery = dispatch_state.delivery_guard();
+                context.ensure_order_context()?;
+                ensure_bindings_resolved(&context.dispatch_state, instrument_id)?;
+                let (orders, _) = cached_order_bindings(&core, &context.dispatch_state);
+                let current = DeriveReconciliationContext { orders, ..context };
+                let observations = observations.lock();
+
+                for (client_order_id, binding) in &observations.bindings {
+                    anyhow::ensure!(
+                        current.order_binding(*client_order_id) == *binding,
+                        "Derive order binding changed during report collection for {client_order_id}",
+                    );
+                }
+
+                let reports = finish(reports, &current)?;
+                for (order, report) in &observations.trigger_orders {
+                    observe_trigger_order(&current.dispatch_state, order, report);
+                }
+
+                for report in &observations.trigger_fills {
+                    observe_trigger_fill(&current.dispatch_state, report);
+                }
+
+                Ok(reports)
+            },
+        ))
     }
 
     fn validate_order(&self, order: &OrderAny) -> anyhow::Result<()> {
@@ -1203,6 +1272,57 @@ impl ExecutionClient for DeriveExecutionClient {
         }
     }
 
+    fn generate_order_status_report_task(
+        &self,
+        cmd: &GenerateOrderStatusReport,
+    ) -> Option<ExecutionReportTask<Option<OrderStatusReport>>> {
+        let command = cmd.clone();
+        self.report_task(
+            cmd.instrument_id,
+            |context| async move { context.generate_order_status_report(&command).await },
+            |report, _| Ok(report),
+        )
+    }
+
+    fn generate_order_status_reports_task(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+    ) -> Option<ExecutionReportTask<Vec<OrderStatusReport>>> {
+        let command = cmd.clone();
+        self.report_task(
+            cmd.instrument_id,
+            |context| async move { context.collect_order_status_reports(&command).await },
+            |reports, _| Ok(reports),
+        )
+    }
+
+    fn generate_fill_reports_task(
+        &self,
+        cmd: &GenerateFillReports,
+    ) -> Option<ExecutionReportTask<Vec<FillReport>>> {
+        let command = cmd.clone();
+        self.report_task(
+            cmd.instrument_id,
+            |context| async move { context.collect_fill_reports(command).await },
+            |mut reports, context| {
+                reports.retain(|report| !context.dispatch_state.contains_trade(&report.trade_id));
+                Ok(reports)
+            },
+        )
+    }
+
+    fn generate_position_status_reports_task(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+    ) -> Option<ExecutionReportTask<Vec<PositionStatusReport>>> {
+        let command = cmd.clone();
+        let context = self.reconciliation_context();
+        Some(ExecutionReportTask::new(
+            async move { context.collect_position_status_reports(&command).await },
+            Ok,
+        ))
+    }
+
     async fn generate_order_status_report(
         &self,
         cmd: &GenerateOrderStatusReport,
@@ -1216,56 +1336,27 @@ impl ExecutionClient for DeriveExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        let context = self.reconciliation_context();
-        let mut reports = context
-            .generate_order_status_reports(cmd)
-            .await?
-            .into_complete("order")?;
-
-        if !cmd.open_only {
-            let mut active_cmd = cmd.clone();
-            active_cmd.open_only = true;
-            let active = context
-                .generate_order_status_reports(&active_cmd)
-                .await?
-                .into_complete("active order")?;
-            reports.extend(active);
-        }
-
-        context.ensure_order_context()?;
-        let reports = deduplicate_order_status_reports(reports)?;
-        log_report_receipt(reports.len(), "OrderStatusReport", cmd.log_receipt_level);
-        Ok(reports)
+        self.reconciliation_context()
+            .collect_order_status_reports(cmd)
+            .await
     }
 
     async fn generate_fill_reports(
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        let log_level = cmd.log_receipt_level;
-        let reports = self
-            .reconciliation_context()
-            .generate_fill_reports(cmd, false)
-            .await?
-            .into_complete("fill")?;
-        log_report_receipt(reports.len(), "FillReport", log_level);
-        Ok(reports)
+        self.reconciliation_context()
+            .collect_fill_reports(cmd)
+            .await
     }
 
     async fn generate_position_status_reports(
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        let snapshot = self
-            .reconciliation_context()
-            .generate_position_status_snapshot(cmd)
-            .await?;
-        log_report_receipt(
-            snapshot.reports.len(),
-            "PositionStatusReport",
-            cmd.log_receipt_level,
-        );
-        Ok(snapshot.reports)
+        self.reconciliation_context()
+            .collect_position_status_reports(cmd)
+            .await
     }
 
     async fn generate_mass_status(
@@ -1348,7 +1439,13 @@ impl ExecutionClient for DeriveExecutionClient {
                     log::warn!("Failed to resolve instrument {venue_symbol}: {e}");
                     dispatch_state.forget(&order_for_task.client_order_id());
                     let ts = clock.get_time_ns();
-                    emit_submit_failure(&emitter, &order_for_task, CommandFailure::not_sent(format!("instrument resolution failed: {e}")), ts, false);
+                    emit_submit_failure(
+                        &emitter,
+                        &order_for_task,
+                        CommandFailure::not_sent(format!("instrument resolution failed: {e}")),
+                        ts,
+                        false,
+                    );
                     return Ok(());
                 }
             };
@@ -1366,7 +1463,13 @@ impl ExecutionClient for DeriveExecutionClient {
                 log::warn!("{reason}");
                 dispatch_state.forget(&order_for_task.client_order_id());
                 let ts = clock.get_time_ns();
-                emit_submit_failure(&emitter, &order_for_task, CommandFailure::not_sent(&reason), ts, false);
+                emit_submit_failure(
+                    &emitter,
+                    &order_for_task,
+                    CommandFailure::not_sent(&reason),
+                    ts,
+                    false,
+                );
                 return Ok(());
             }
 
@@ -1389,7 +1492,13 @@ impl ExecutionClient for DeriveExecutionClient {
                         log::warn!("{reason}");
                         dispatch_state.forget(&order_for_task.client_order_id());
                         let ts = clock.get_time_ns();
-                        emit_submit_failure(&emitter, &order_for_task, CommandFailure::not_sent(&reason), ts, false);
+                        emit_submit_failure(
+                            &emitter,
+                            &order_for_task,
+                            CommandFailure::not_sent(&reason),
+                            ts,
+                            false,
+                        );
                         return Ok(());
                     }
                 };
@@ -1410,7 +1519,13 @@ impl ExecutionClient for DeriveExecutionClient {
                         log::warn!("{reason}");
                         dispatch_state.forget(&order_for_task.client_order_id());
                         let ts = clock.get_time_ns();
-                        emit_submit_failure(&emitter, &order_for_task, CommandFailure::not_sent(&reason), ts, false);
+                        emit_submit_failure(
+                            &emitter,
+                            &order_for_task,
+                            CommandFailure::not_sent(&reason),
+                            ts,
+                            false,
+                        );
                         return Ok(());
                     }
                 }
@@ -1428,7 +1543,13 @@ impl ExecutionClient for DeriveExecutionClient {
                         log::warn!("{reason}");
                         dispatch_state.forget(&order_for_task.client_order_id());
                         let ts = clock.get_time_ns();
-                        emit_submit_failure(&emitter, &order_for_task, CommandFailure::not_sent(&reason), ts, false);
+                        emit_submit_failure(
+                            &emitter,
+                            &order_for_task,
+                            CommandFailure::not_sent(&reason),
+                            ts,
+                            false,
+                        );
                         return Ok(());
                     }
                 };
@@ -1449,7 +1570,13 @@ impl ExecutionClient for DeriveExecutionClient {
                         log::warn!("{reason}");
                         dispatch_state.forget(&order_for_task.client_order_id());
                         let ts = clock.get_time_ns();
-                        emit_submit_failure(&emitter, &order_for_task, CommandFailure::not_sent(&reason), ts, false);
+                        emit_submit_failure(
+                            &emitter,
+                            &order_for_task,
+                            CommandFailure::not_sent(&reason),
+                            ts,
+                            false,
+                        );
                         return Ok(());
                     }
                 }
@@ -1473,7 +1600,13 @@ impl ExecutionClient for DeriveExecutionClient {
                     );
                     dispatch_state.forget(&order_for_task.client_order_id());
                     let ts = clock.get_time_ns();
-                    emit_submit_failure(&emitter, &order_for_task, CommandFailure::not_sent(&reason), ts, due_post_only);
+                    emit_submit_failure(
+                        &emitter,
+                        &order_for_task,
+                        CommandFailure::not_sent(&reason),
+                        ts,
+                        due_post_only,
+                    );
                     return Ok(());
                 }
             };
@@ -1495,7 +1628,15 @@ impl ExecutionClient for DeriveExecutionClient {
                         );
                         dispatch_state.forget(&order_for_task.client_order_id());
                         let ts = clock.get_time_ns();
-                        emit_submit_failure(&emitter, &order_for_task, CommandFailure::not_sent(format!("order expiry validation failed: {e}")), ts, false);
+                        emit_submit_failure(
+                            &emitter,
+                            &order_for_task,
+                            CommandFailure::not_sent(format!(
+                                "order expiry validation failed: {e}"
+                            )),
+                            ts,
+                            false,
+                        );
                         return Ok(());
                     }
                 };
@@ -1552,7 +1693,13 @@ impl ExecutionClient for DeriveExecutionClient {
                     log::warn!("Order encode failed for {}: {e}", order_for_task.client_order_id());
                     dispatch_state.forget(&order_for_task.client_order_id());
                     let ts = clock.get_time_ns();
-                    emit_submit_failure(&emitter, &order_for_task, CommandFailure::not_sent(format!("order encoding failed: {e}")), ts, false);
+                    emit_submit_failure(
+                        &emitter,
+                        &order_for_task,
+                        CommandFailure::not_sent(format!("order encoding failed: {e}")),
+                        ts,
+                        false,
+                    );
                     return Ok(());
                 }
             };
@@ -1687,6 +1834,7 @@ impl ExecutionClient for DeriveExecutionClient {
                     .or(cmd.venue_order_id),
                 CommandFailure::not_sent(e.to_string()),
                 self.clock.get_time_ns(),
+                Some(cmd.command_id),
             );
             return Ok(());
         }
@@ -1719,7 +1867,16 @@ impl ExecutionClient for DeriveExecutionClient {
                     Ok(id) => Some(id),
                     Err(reason) => {
                         log::warn!("Cannot cancel trigger order {client_order_id}: {reason}");
-                        emit_cancel_failure(&emitter, strategy_id, instrument_id, client_order_id, None, CommandFailure::not_sent(&reason), clock.get_time_ns());
+                        emit_cancel_failure(
+                            &emitter,
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            None,
+                            CommandFailure::not_sent(&reason),
+                            clock.get_time_ns(),
+                            Some(cmd.command_id),
+                        );
                         return Ok(());
                     }
                 }
@@ -1759,7 +1916,16 @@ impl ExecutionClient for DeriveExecutionClient {
                                 "Derive rejected cancel for {client_order_id}: {reason}"
                             );
                             let ts = clock.get_time_ns();
-                            emit_cancel_failure(&emitter, strategy_id, instrument_id, client_order_id, None, CommandFailure::venue_rejected(reason), ts);
+                            emit_cancel_failure(
+                                &emitter,
+                                strategy_id,
+                                instrument_id,
+                                client_order_id,
+                                None,
+                                CommandFailure::venue_rejected(reason),
+                                ts,
+                                Some(cmd.command_id),
+                            );
                         }
 
                         None
@@ -1780,7 +1946,16 @@ impl ExecutionClient for DeriveExecutionClient {
                 Err((failure, _)) => {
                     log::debug!("Derive rejected cancel for {client_order_id}: {failure:?}");
                     let ts = clock.get_time_ns();
-                    emit_cancel_failure(&emitter, strategy_id, instrument_id, client_order_id, venue_order_id, failure, ts);
+                    emit_cancel_failure(
+                        &emitter,
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        venue_order_id,
+                        failure,
+                        ts,
+                        Some(cmd.command_id),
+                    );
                 }
             }
 
@@ -1901,6 +2076,7 @@ impl ExecutionClient for DeriveExecutionClient {
                     .or(cmd.venue_order_id),
                 CommandFailure::not_sent(e.to_string()),
                 ts_now,
+                Some(cmd.command_id),
             );
             return Ok(());
         }
@@ -1920,6 +2096,7 @@ impl ExecutionClient for DeriveExecutionClient {
                 None,
                 CommandFailure::not_sent(reason),
                 ts_now,
+                Some(cmd.command_id),
             );
             return Ok(());
         };
@@ -1935,6 +2112,7 @@ impl ExecutionClient for DeriveExecutionClient {
                 Some(venue_order_id),
                 CommandFailure::not_sent(reason),
                 ts_now,
+                Some(cmd.command_id),
             );
             return Ok(());
         };
@@ -1950,6 +2128,7 @@ impl ExecutionClient for DeriveExecutionClient {
                 Some(venue_order_id),
                 CommandFailure::not_sent(reason),
                 ts_now,
+                Some(cmd.command_id),
             );
             return Ok(());
         }
@@ -1965,6 +2144,7 @@ impl ExecutionClient for DeriveExecutionClient {
                 Some(venue_order_id),
                 CommandFailure::not_sent(format!("replace expiry validation failed: {e}")),
                 ts_now,
+                Some(cmd.command_id),
             );
             return Ok(());
         }
@@ -2006,6 +2186,7 @@ impl ExecutionClient for DeriveExecutionClient {
                     Some(stale_venue_order_id),
                     CommandFailure::not_sent("Another modify is pending"),
                     clock.get_time_ns(),
+                    Some(cmd.command_id),
                 );
                 return Ok(());
             }
@@ -2027,7 +2208,16 @@ impl ExecutionClient for DeriveExecutionClient {
                     let reason = format!("instrument resolution failed: {e}");
                     log::warn!("Cannot modify order {client_order_id}: {reason}");
                     let ts = clock.get_time_ns();
-                    emit_modify_failure(&emitter, strategy_id, instrument_id, client_order_id, Some(stale_venue_order_id), CommandFailure::not_sent(&reason), ts);
+                    emit_modify_failure(
+                        &emitter,
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        Some(stale_venue_order_id),
+                        CommandFailure::not_sent(&reason),
+                        ts,
+                        Some(cmd.command_id),
+                    );
                     dispatch_state.clear_pending_modify(&client_order_id);
                     return Ok(());
                 }
@@ -2042,7 +2232,16 @@ impl ExecutionClient for DeriveExecutionClient {
                     let (reason, _) = ws_rejection_reason(&e);
                     log::warn!("Cannot reserve Derive replace quota for {client_order_id}: {reason}");
                     let ts = clock.get_time_ns();
-                    emit_modify_failure(&emitter, strategy_id, instrument_id, client_order_id, Some(stale_venue_order_id), CommandFailure::not_sent(&reason), ts);
+                    emit_modify_failure(
+                        &emitter,
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        Some(stale_venue_order_id),
+                        CommandFailure::not_sent(&reason),
+                        ts,
+                        Some(cmd.command_id),
+                    );
                     dispatch_state.clear_pending_modify(&client_order_id);
                     return Ok(());
                 }
@@ -2059,7 +2258,16 @@ impl ExecutionClient for DeriveExecutionClient {
                 Ok(amounts) => amounts,
                 Err(e) => {
                     log::warn!("Cannot prepare Derive replace for {client_order_id}: {e:#}");
-                    emit_modify_failure(&emitter, strategy_id, instrument_id, client_order_id, Some(stale_venue_order_id), CommandFailure::not_sent(e.to_string()), clock.get_time_ns());
+                    emit_modify_failure(
+                        &emitter,
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        Some(stale_venue_order_id),
+                        CommandFailure::not_sent(e.to_string()),
+                        clock.get_time_ns(),
+                        Some(cmd.command_id),
+                    );
                     dispatch_state.clear_pending_modify(&client_order_id);
                     return Ok(());
                 }
@@ -2071,7 +2279,16 @@ impl ExecutionClient for DeriveExecutionClient {
                     let reason = format!("replace expiry validation failed: {e}");
                     log::warn!("Cannot modify order {client_order_id}: {reason}");
                     let ts = clock.get_time_ns();
-                    emit_modify_failure(&emitter, strategy_id, instrument_id, client_order_id, Some(stale_venue_order_id), CommandFailure::not_sent(&reason), ts);
+                    emit_modify_failure(
+                        &emitter,
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        Some(stale_venue_order_id),
+                        CommandFailure::not_sent(&reason),
+                        ts,
+                        Some(cmd.command_id),
+                    );
                     dispatch_state.clear_pending_modify(&client_order_id);
                     return Ok(());
                 }
@@ -2085,6 +2302,7 @@ impl ExecutionClient for DeriveExecutionClient {
                 client_order_id,
                 stale_venue_order_id,
                 clock,
+                Some(cmd.command_id),
             ) {
                 Some(nonce) => nonce,
                 None => {
@@ -2114,7 +2332,16 @@ impl ExecutionClient for DeriveExecutionClient {
                     let reason = format!("replace encoding failed: {e}");
                     log::warn!("Cannot modify order {client_order_id}: {reason}");
                     let ts = clock.get_time_ns();
-                    emit_modify_failure(&emitter, strategy_id, instrument_id, client_order_id, Some(stale_venue_order_id), CommandFailure::not_sent(&reason), ts);
+                    emit_modify_failure(
+                        &emitter,
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        Some(stale_venue_order_id),
+                        CommandFailure::not_sent(&reason),
+                        ts,
+                        Some(cmd.command_id),
+                    );
                     dispatch_state.clear_pending_modify(&client_order_id);
                     return Ok(());
                 }
@@ -2171,7 +2398,16 @@ impl ExecutionClient for DeriveExecutionClient {
                     dispatch_state.take_modify_target(&client_order_id);
                     log::debug!("Derive rejected modify for {client_order_id}: {failure:?}");
                     let ts = clock.get_time_ns();
-                    emit_modify_failure(&emitter, strategy_id, instrument_id, client_order_id, Some(stale_venue_order_id), failure, ts);
+                    emit_modify_failure(
+                        &emitter,
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        Some(stale_venue_order_id),
+                        failure,
+                        ts,
+                        Some(cmd.command_id),
+                    );
                 }
             }
 
@@ -2541,6 +2777,7 @@ struct DeriveReconciliationContext {
     instruments: Arc<AtomicMap<InstrumentId, Arc<DeriveInstrument>>>,
     orders: AHashMap<ClientOrderId, OrderBinding>,
     terminal_revision: Arc<()>,
+    report_observations: Option<Arc<Mutex<ReportObservations>>>,
 }
 
 impl DeriveReconciliationContext {
@@ -2576,6 +2813,57 @@ impl DeriveReconciliationContext {
         Ok(())
     }
 
+    async fn collect_order_status_reports(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let mut reports = self
+            .generate_order_status_reports(cmd)
+            .await?
+            .into_complete("order")?;
+
+        if !cmd.open_only {
+            let mut active_cmd = cmd.clone();
+            active_cmd.open_only = true;
+            let active = self
+                .generate_order_status_reports(&active_cmd)
+                .await?
+                .into_complete("active order")?;
+            reports.extend(active);
+        }
+
+        self.ensure_order_context()?;
+        let reports = deduplicate_order_status_reports(reports)?;
+        log_report_receipt(reports.len(), "OrderStatusReport", cmd.log_receipt_level);
+        Ok(reports)
+    }
+
+    async fn collect_fill_reports(
+        &self,
+        cmd: GenerateFillReports,
+    ) -> anyhow::Result<Vec<FillReport>> {
+        let log_level = cmd.log_receipt_level;
+        let reports = self
+            .generate_fill_reports(cmd, false)
+            .await?
+            .into_complete("fill")?;
+        log_report_receipt(reports.len(), "FillReport", log_level);
+        Ok(reports)
+    }
+
+    async fn collect_position_status_reports(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        let snapshot = self.generate_position_status_snapshot(cmd).await?;
+        log_report_receipt(
+            snapshot.reports.len(),
+            "PositionStatusReport",
+            cmd.log_receipt_level,
+        );
+        Ok(snapshot.reports)
+    }
+
     async fn generate_order_status_report(
         &self,
         cmd: &GenerateOrderStatusReport,
@@ -2600,8 +2888,7 @@ impl DeriveReconciliationContext {
             .or(cmd.client_order_id);
 
         if let Ok(venue_order_id) = VenueOrderId::new_checked(&order.order_id) {
-            validate_report_binding(
-                &self.dispatch_state,
+            self.validate_report_binding(
                 client_order_id,
                 venue_order_id,
                 format_instrument_id(order.instrument_name)?,
@@ -2647,12 +2934,7 @@ impl DeriveReconciliationContext {
             .or(cmd.client_order_id);
 
         if let Ok(venue_order_id) = VenueOrderId::new_checked(&order.order_id) {
-            validate_report_binding(
-                &self.dispatch_state,
-                client_order_id,
-                venue_order_id,
-                instrument_id,
-            )?;
+            self.validate_report_binding(client_order_id, venue_order_id, instrument_id)?;
         }
 
         if tracked_order_identity(client_order_id, instrument_id, &self.dispatch_state).is_some() {
@@ -2678,7 +2960,7 @@ impl DeriveReconciliationContext {
             report = report.with_client_order_id(client_order_id);
         }
 
-        observe_trigger_order(&self.dispatch_state, &order, &report);
+        self.observe_trigger_order(&order, &report);
         self.project_order_report(&order, report, &[], false)
             .await
             .map(Some)
@@ -2855,7 +3137,7 @@ impl DeriveReconciliationContext {
         let known_orders: Vec<_> = orders.iter().chain(ancestors).collect();
 
         for order in &orders {
-            observe_order_binding(&self.dispatch_state, order);
+            self.observe_order_binding(order)?;
             ensure_bindings_resolved(&self.dispatch_state, cmd.instrument_id)?;
             let (price_precision, size_precision) = self.order_precision(order)?;
             complete &= price_precision.is_some();
@@ -2868,13 +3150,12 @@ impl DeriveReconciliationContext {
                 ts_init,
             ) {
                 Ok(mut report) => {
-                    validate_report_binding(
-                        &self.dispatch_state,
+                    self.validate_report_binding(
                         report.client_order_id,
                         report.venue_order_id,
                         report.instrument_id,
                     )?;
-                    observe_trigger_order(&self.dispatch_state, order, &report);
+                    self.observe_trigger_order(order, &report);
                     if report
                         .client_order_id
                         .and_then(|cid| self.order_binding(cid))
@@ -2928,6 +3209,10 @@ impl DeriveReconciliationContext {
         &self,
         instrument_id: Option<InstrumentId>,
     ) -> anyhow::Result<()> {
+        if self.report_observations.is_some() {
+            return ensure_bindings_resolved(&self.dispatch_state, instrument_id);
+        }
+
         while let Some(client_order_id) = {
             let _delivery = self.dispatch_state.delivery_guard();
             self.dispatch_state
@@ -3072,9 +3357,19 @@ impl DeriveReconciliationContext {
     }
 
     fn order_binding(&self, client_order_id: ClientOrderId) -> Option<OrderBinding> {
-        self.dispatch_state
+        let binding = self
+            .dispatch_state
             .order_binding(&client_order_id)
-            .or_else(|| self.orders.get(&client_order_id).cloned())
+            .or_else(|| self.orders.get(&client_order_id).cloned());
+
+        if let Some(observations) = &self.report_observations {
+            observations
+                .lock()
+                .bindings
+                .push((client_order_id, binding.clone()));
+        }
+
+        binding
     }
 
     async fn project_order_report(
@@ -3320,13 +3615,12 @@ impl DeriveReconciliationContext {
                 ts_init,
             ) {
                 Ok(Some(report)) => {
-                    validate_report_binding(
-                        &self.dispatch_state,
+                    self.validate_report_binding(
                         report.client_order_id,
                         report.venue_order_id,
                         report.instrument_id,
                     )?;
-                    observe_trigger_fill(&self.dispatch_state, &report);
+                    self.observe_trigger_fill(&report);
                     let retain = retain_untracked
                         && report
                             .client_order_id
@@ -3995,6 +4289,111 @@ impl DeriveReconciliationContext {
         );
         Ok(precision)
     }
+
+    fn validate_report_binding(
+        &self,
+        client_order_id: Option<ClientOrderId>,
+        venue_order_id: VenueOrderId,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<()> {
+        let _delivery = self.dispatch_state.delivery_guard();
+
+        if self.report_observations.is_none() {
+            return validate_report_binding(
+                &self.dispatch_state,
+                client_order_id,
+                venue_order_id,
+                instrument_id,
+            );
+        }
+
+        if let Some(client_order_id) = client_order_id {
+            self.order_binding(client_order_id);
+        }
+
+        check_report_binding(
+            &self.dispatch_state,
+            client_order_id,
+            venue_order_id,
+            instrument_id,
+        )
+    }
+
+    fn observe_order_binding(&self, order: &DeriveOrder) -> anyhow::Result<()> {
+        if self.report_observations.is_none() {
+            observe_order_binding(&self.dispatch_state, order);
+            return Ok(());
+        }
+
+        let (Ok(client_order_id), Ok(instrument_id), Ok(venue_order_id)) = (
+            ClientOrderId::new_checked(order.label),
+            format_instrument_id(order.instrument_name),
+            VenueOrderId::new_checked(&order.order_id),
+        ) else {
+            return Ok(());
+        };
+
+        let _delivery = self.dispatch_state.delivery_guard();
+        self.order_binding(client_order_id);
+        if tracked_order_identity(Some(client_order_id), instrument_id, &self.dispatch_state)
+            .is_some()
+            && self
+                .dispatch_state
+                .bound_venue_order_id(&client_order_id)
+                .is_some()
+        {
+            check_report_binding(
+                &self.dispatch_state,
+                Some(client_order_id),
+                venue_order_id,
+                instrument_id,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn observe_trigger_order(&self, order: &DeriveOrder, report: &OrderStatusReport) {
+        if let Some(observations) = &self.report_observations {
+            if tracked_order_identity(
+                report.client_order_id,
+                report.instrument_id,
+                &self.dispatch_state,
+            )
+            .is_some_and(|(_, identity)| is_derive_trigger_order_type(identity.order_type))
+            {
+                observations
+                    .lock()
+                    .trigger_orders
+                    .push((order.clone(), report.clone()));
+            }
+        } else {
+            observe_trigger_order(&self.dispatch_state, order, report);
+        }
+    }
+
+    fn observe_trigger_fill(&self, report: &FillReport) {
+        if let Some(observations) = &self.report_observations {
+            if tracked_order_identity(
+                report.client_order_id,
+                report.instrument_id,
+                &self.dispatch_state,
+            )
+            .is_some_and(|(_, identity)| is_derive_trigger_order_type(identity.order_type))
+            {
+                observations.lock().trigger_fills.push(report.clone());
+            }
+        } else {
+            observe_trigger_fill(&self.dispatch_state, report);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ReportObservations {
+    bindings: Vec<(ClientOrderId, Option<OrderBinding>)>,
+    trigger_orders: Vec<(DeriveOrder, OrderStatusReport)>,
+    trigger_fills: Vec<FillReport>,
 }
 
 fn ambiguous_history_client_order_ids<'a>(
@@ -4076,14 +4475,31 @@ fn validate_report_binding(
     let _delivery = dispatch_state.delivery_guard();
     if let Some((client_order_id, _)) =
         tracked_order_identity(client_order_id, instrument_id, dispatch_state)
+        && !dispatch_state.knows_venue_leg(&client_order_id, venue_order_id)
     {
-        if !dispatch_state.knows_venue_leg(&client_order_id, venue_order_id) {
-            dispatch_state.defer_binding(client_order_id, venue_order_id);
-        }
+        dispatch_state.defer_binding(client_order_id, venue_order_id);
+    }
 
-        if dispatch_state.binding_unresolved(&client_order_id) {
-            return Err(UnresolvedOrderBinding(client_order_id).into());
-        }
+    check_report_binding(
+        dispatch_state,
+        client_order_id,
+        venue_order_id,
+        instrument_id,
+    )
+}
+
+fn check_report_binding(
+    dispatch_state: &WsDispatchState,
+    client_order_id: Option<ClientOrderId>,
+    venue_order_id: VenueOrderId,
+    instrument_id: InstrumentId,
+) -> anyhow::Result<()> {
+    if let Some((client_order_id, _)) =
+        tracked_order_identity(client_order_id, instrument_id, dispatch_state)
+        && (!dispatch_state.knows_venue_leg(&client_order_id, venue_order_id)
+            || dispatch_state.binding_unresolved(&client_order_id))
+    {
+        return Err(UnresolvedOrderBinding(client_order_id).into());
     }
 
     Ok(())
@@ -4348,6 +4764,10 @@ fn emit_submit_failure(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Failure emission retains order identity and command correlation"
+)]
 fn emit_cancel_failure(
     emitter: &ExecutionEventEmitter,
     strategy_id: StrategyId,
@@ -4356,19 +4776,39 @@ fn emit_cancel_failure(
     venue_order_id: Option<VenueOrderId>,
     failure: CommandFailure,
     ts: UnixNanos,
+    causation_id: Option<UUID4>,
 ) {
-    if let Some(reason) = command_rejection_reason(failure) {
-        emitter.emit_order_cancel_rejected_event(
-            strategy_id,
-            instrument_id,
-            client_order_id,
-            venue_order_id,
-            &reason,
-            ts,
-        );
+    match failure {
+        CommandFailure::NotSent(reason) => {
+            emitter.emit_order_cancel_denied_event(
+                strategy_id,
+                instrument_id,
+                client_order_id,
+                venue_order_id,
+                &strategy_rejection_reason(&reason),
+                ts,
+                causation_id,
+            );
+        }
+        CommandFailure::VenueRejected(reason) => {
+            emitter.emit_order_cancel_rejected_event(
+                strategy_id,
+                instrument_id,
+                client_order_id,
+                venue_order_id,
+                &strategy_rejection_reason(&reason),
+                ts,
+                causation_id,
+            );
+        }
+        CommandFailure::Ambiguous(_) => {}
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Failure emission retains order identity and command correlation"
+)]
 fn emit_modify_failure(
     emitter: &ExecutionEventEmitter,
     strategy_id: StrategyId,
@@ -4377,20 +4817,40 @@ fn emit_modify_failure(
     venue_order_id: Option<VenueOrderId>,
     failure: CommandFailure,
     ts: UnixNanos,
+    causation_id: Option<UUID4>,
 ) {
-    if let Some(reason) = command_rejection_reason(failure) {
-        emitter.emit_order_modify_rejected_event(
-            strategy_id,
-            instrument_id,
-            client_order_id,
-            venue_order_id,
-            &reason,
-            ts,
-        );
+    match failure {
+        CommandFailure::NotSent(reason) => {
+            emitter.emit_order_modify_denied_event(
+                strategy_id,
+                instrument_id,
+                client_order_id,
+                venue_order_id,
+                &strategy_rejection_reason(&reason),
+                ts,
+                causation_id,
+            );
+        }
+        CommandFailure::VenueRejected(reason) => {
+            emitter.emit_order_modify_rejected_event(
+                strategy_id,
+                instrument_id,
+                client_order_id,
+                venue_order_id,
+                &strategy_rejection_reason(&reason),
+                ts,
+                causation_id,
+            );
+        }
+        CommandFailure::Ambiguous(_) => {}
     }
 }
 
 fn ws_rejection_reason(error: &DeriveWsError) -> (String, bool) {
+    if let Some(reason) = error.session_key_expiry_reason() {
+        return (reason, false);
+    }
+
     match error {
         DeriveWsError::JsonRpc { code, message, .. } => (
             format!("{code}: {}", strategy_rejection_reason(message))
@@ -5908,6 +6368,10 @@ fn resolve_submit_nonce(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Failure emission retains order identity and command correlation"
+)]
 fn resolve_modify_nonce(
     nonce: Result<u64, NonceError>,
     emitter: &ExecutionEventEmitter,
@@ -5916,6 +6380,7 @@ fn resolve_modify_nonce(
     client_order_id: ClientOrderId,
     venue_order_id: VenueOrderId,
     clock: &'static AtomicTime,
+    causation_id: Option<UUID4>,
 ) -> Option<u64> {
     match nonce {
         Ok(nonce) => Some(nonce),
@@ -5930,6 +6395,7 @@ fn resolve_modify_nonce(
                 Some(venue_order_id),
                 CommandFailure::not_sent(&reason),
                 clock.get_time_ns(),
+                causation_id,
             );
             None
         }
@@ -6896,12 +7362,13 @@ mod tests {
             client_order_id,
             venue_order_id,
             clock,
+            Some(UUID4::default()),
         );
-        let event = rx.try_recv().expect("OrderModifyRejected event");
+        let event = rx.try_recv().expect("OrderModifyDenied event");
 
         assert!(nonce.is_none());
 
-        if let ExecutionEvent::Order(OrderEventAny::ModifyRejected(rejected)) = event {
+        if let ExecutionEvent::Order(OrderEventAny::ModifyDenied(rejected)) = event {
             assert_eq!(rejected.client_order_id, client_order_id);
             assert_eq!(rejected.venue_order_id, Some(venue_order_id));
             assert_eq!(
@@ -6909,7 +7376,7 @@ mod tests {
                 "nonce allocation failed: system clock is before UNIX epoch",
             );
         } else {
-            panic!("expected OrderModifyRejected, event was {event:?}");
+            panic!("expected OrderModifyDenied, event was {event:?}");
         }
     }
 
@@ -9238,6 +9705,249 @@ mod tests {
         );
 
         assert!(!state.contains_trade(&trade_id));
+    }
+
+    #[rstest]
+    #[case::accept(0)]
+    #[case::discard(1)]
+    #[case::cancel(2)]
+    #[case::pending_modify(3)]
+    #[case::changed_binding(4)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_report_task_defers_trigger_delivery(
+        #[case] disposition: u8,
+        #[values(false, true)] fills: bool,
+    ) {
+        let client = test_client_with_instrument();
+        let cid = ClientOrderId::from("TRIGGER-REPORT");
+        let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+        let venue_order_id = VenueOrderId::from("trigger-native");
+        client.dispatch_state.register_identity(
+            cid,
+            OrderIdentity {
+                instrument_id,
+                strategy_id: StrategyId::from("TRIGGER-001"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::StopLimit,
+            },
+        );
+
+        client
+            .dispatch_state
+            .record_venue_order_id(cid, venue_order_id);
+        let mut native: DeriveOrder = serde_json::from_str(include_str!(
+            "../test_data/perps/http_order_eth_partially_filled.json"
+        ))
+        .unwrap();
+        native.subaccount_id = client.credential.subaccount_id() as i64;
+        native.order_status = DeriveOrderStatus::Open;
+        native.order_id = venue_order_id.to_string();
+        native.label = cid.inner();
+        let mut order = parse_derive_order_to_report_with_precision(
+            &native,
+            client.core.account_id,
+            Some(2),
+            Some(3),
+            UnixNanos::from(123),
+        )
+        .unwrap();
+        order.order_type = OrderType::StopLimit;
+        order.order_side = Some(OrderSide::Buy);
+        let trade: DeriveTrade = serde_json::from_str(include_str!(
+            "../test_data/perps/http_private_trade_eth.json"
+        ))
+        .unwrap();
+        let mut fill = parse_derive_trade_to_fill_report_with_precision(
+            &trade,
+            client.core.account_id,
+            Currency::USDC(),
+            Some(2),
+            Some(3),
+            UnixNanos::from(456),
+        )
+        .unwrap()
+        .unwrap();
+        fill.client_order_id = Some(cid);
+        fill.venue_order_id = venue_order_id;
+        fill.instrument_id = instrument_id;
+        fill.order_side = OrderSide::Buy;
+        let (ready, collected) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+
+        let task = client
+            .report_task(
+                Some(instrument_id),
+                move |context| async move {
+                    context.validate_report_binding(Some(cid), venue_order_id, instrument_id)?;
+                    if fills {
+                        context.observe_trigger_fill(&fill);
+                    } else {
+                        context.observe_trigger_order(&native, &order);
+                    }
+
+                    ready.send(()).unwrap();
+                    released.await.unwrap();
+                    Ok(())
+                },
+                |(), _| Ok(()),
+            )
+            .unwrap();
+
+        let worker = tokio::spawn(task.collection);
+        collected.await.unwrap();
+        assert!(!client.dispatch_state.trigger_active(&cid));
+
+        if disposition == 2 {
+            worker.abort();
+            assert!(worker.await.unwrap_err().is_cancelled());
+            drop(task.finish);
+        } else {
+            release.send(()).unwrap();
+            worker.await.unwrap();
+            assert!(!client.dispatch_state.trigger_active(&cid));
+
+            match disposition {
+                0 => (task.finish)().unwrap(),
+                1 => drop(task.finish),
+                3 => {
+                    client
+                        .dispatch_state
+                        .mark_pending_modify(cid, venue_order_id);
+                    assert_eq!(
+                        (task.finish)().unwrap_err().to_string(),
+                        "unresolved Derive venue binding for TRIGGER-REPORT"
+                    );
+                }
+                4 => {
+                    client
+                        .dispatch_state
+                        .record_venue_order_id(cid, VenueOrderId::from("changed-native"));
+                    assert_eq!(
+                        (task.finish)().unwrap_err().to_string(),
+                        "Derive order binding changed during report collection for TRIGGER-REPORT"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        assert_eq!(client.dispatch_state.trigger_active(&cid), disposition == 0);
+    }
+
+    #[rstest]
+    fn test_report_tasks_keep_pending_replacement_inline() {
+        let client = test_client_with_instrument();
+        let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+        let cid = ClientOrderId::from("PENDING-REPORT");
+        client.dispatch_state.register_identity(
+            cid,
+            OrderIdentity {
+                instrument_id,
+                strategy_id: StrategyId::from("REPORT-001"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+            },
+        );
+
+        client
+            .dispatch_state
+            .mark_pending_modify(cid, VenueOrderId::from("pending-native"));
+
+        let single = GenerateOrderStatusReport::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(instrument_id),
+            Some(cid),
+            None,
+            None,
+            None,
+        );
+
+        let orders = GenerateOrderStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            true,
+            Some(instrument_id),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let fills = GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(instrument_id),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let positions = GeneratePositionStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(instrument_id),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(client.generate_order_status_report_task(&single).is_none());
+        assert!(client.generate_order_status_reports_task(&orders).is_none());
+        assert!(client.generate_fill_reports_task(&fills).is_none());
+        assert!(
+            client
+                .generate_position_status_reports_task(&positions)
+                .is_some()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_report_task_does_not_defer_unproved_binding() {
+        let client = test_client_with_instrument();
+        let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+        let cid = ClientOrderId::from("UNPROVED-REPORT");
+        let current = VenueOrderId::from("proved-native");
+        client.dispatch_state.register_identity(
+            cid,
+            OrderIdentity {
+                instrument_id,
+                strategy_id: StrategyId::from("REPORT-001"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+            },
+        );
+
+        client.dispatch_state.record_venue_order_id(cid, current);
+
+        let task = client
+            .report_task(
+                Some(instrument_id),
+                move |context| async move {
+                    context.validate_report_binding(
+                        Some(cid),
+                        VenueOrderId::from("unproved-native"),
+                        instrument_id,
+                    )
+                },
+                |(), _| Ok(()),
+            )
+            .unwrap();
+
+        tokio::spawn(task.collection).await.unwrap();
+        let error = (task.finish)().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unresolved Derive venue binding for UNPROVED-REPORT"
+        );
+        assert!(!client.dispatch_state.binding_unresolved(&cid));
+        assert_eq!(
+            client.dispatch_state.bound_venue_order_id(&cid),
+            Some(current)
+        );
+        assert_eq!(client.dispatch_state.venue_order_legs(&cid), vec![current]);
     }
 
     fn sample_derive_instrument() -> DeriveInstrument {

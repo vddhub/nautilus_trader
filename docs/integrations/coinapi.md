@@ -21,10 +21,11 @@ The Rust crate also exposes `CoinApiHttpClient` and `CoinApiWebSocketClient` for
 
 ## Examples
 
+- [Backtest with Pre-IPO Order Book Data (CoinAPI)](https://github.com/nautechsystems/nautilus_trader/blob/develop/docs/tutorials/backtest_orderbook_coinapi.py)
 - [Python examples](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/coinapi/)
 - [Rust examples](https://github.com/nautechsystems/nautilus_trader/tree/develop/crates/adapters/coinapi/examples/)
 
-The examples load Coinbase BTC/USD, stream quotes, trades, and one-minute bars, and request recent
+The live examples load Coinbase BTC/USD, stream quotes, trades, and one-minute bars, and request recent
 bars. They use a 10-credit REST budget and a price precision override of 3. Edit the instrument and
 subscription settings for your feed, and update the precision override when changing instruments.
 Historical data can lag the live feed, so a request for recent bars may return no records.
@@ -500,8 +501,10 @@ are filtered out.
 #### Page sizes and completion
 
 Each page requests the largest limit that fits the remaining request limit, the 100,000-record
-maximum, and the remaining credit budget. A short page, or a full page reaching the request limit,
-completes the range. With the default 100-credit budget, a page holds at most 10,000 records, so
+maximum, and the remaining credit budget. OHLCV pages request at least two records because a fractional
+start can include a leading period that starts before the window. The returned records still obey the request limit.
+The range completes when a page is short or reaches the window's end, or when retained records fill
+the request limit. With the default 100-credit budget, a page holds at most 10,000 records, so
 continuation beyond one page needs a larger budget.
 
 #### Records sharing a timestamp
@@ -510,17 +513,24 @@ Pagination avoids duplicate records at page boundaries by rereading a trailing t
 when a full page needs continuation. Paging fails if records at one timestamp fill a whole page,
 preventing cursor advancement, or if a page is not in ascending order.
 
+CoinAPI documents ascending results but does not specify the ordering clock or stable ordering within
+timestamp ties. Pagination assumes inclusive restarts by exchange time for quotes and trades and by
+period start for OHLCV. Observed responses match this assumption, but CoinAPI does not guarantee it
+for every symbol or window.
+
 #### Records outside the window
 
-Records outside the window are dropped. CoinAPI returns nearby OHLCV periods from the same UTC
-date when the window has no trades, and a page holding only such periods completes the range.
+Records outside the window are dropped. CoinAPI can return OHLCV periods before a fractional
+`time_start` or at or after `time_end`. It also returns nearby OHLCV periods from the same UTC date
+when the window has no trades, and a page holding only such periods completes the range.
+Leading periods do not count toward the request limit; pagination continues when later records remain in the window.
 
 #### Credit exhaustion and concurrent ranges
 
 If the credit budget cannot fund the next page, the result carries the records gathered so far and sets
-`is_truncated=true`. The budget can be insufficient after a failed attempt keeps its reservation. Without
-affordable credit for the first page, the request fails. Range requests on one client run one at a time, so
-each sizes its pages after earlier ranges have settled their credits.
+`is_truncated=true`. The budget can be insufficient after a failed attempt keeps its reservation.
+If no records have been retained, the request fails, including after filtering and restarting a page.
+Range requests on one client run one at a time, so each sizes its pages after earlier ranges have settled their credits.
 
 ## Raw WebSocket streams
 
@@ -655,9 +665,10 @@ hold one symbol under
 `T-{SCHEMA}/D-{YYYYMMDD|YYYYMMDDHH}/E-{EXCHANGE}/IDDI-{ID}+SC-{SYMBOL_ID}+S-{EXCHANGE_SYMBOL}.csv.gz`.
 Pass an explicit `instrument_id` for each file.
 
-CoinAPI also documents export variants with comma delimiters, full date-time book timestamps, or numeric book
-update types. These loaders require semicolon delimiters, time-of-day book timestamps, and named book updates
-such as `SNAPSHOT`, `ADD`, and `SET`. Convert other layouts before loading them. See the
+The loaders accept named book updates and numeric codes: `0=ADD`, `1=SUB`, `2=SET`, `3=DELETE`, and
+`4=MATCH`. Snapshots require the named `SNAPSHOT` update. CoinAPI also documents export variants with comma
+delimiters or full date-time book timestamps. These loaders require semicolon delimiters and time-of-day
+book timestamps. Convert other layouts before loading them. See the
 [full-book dataset guide](https://www.coinapi.io/products/flat-files/docs/datasets/limitbook?ref=nautilus).
 
 #### Buckets and retention

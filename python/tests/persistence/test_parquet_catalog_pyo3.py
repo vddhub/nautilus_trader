@@ -46,6 +46,7 @@ from nautilus_trader.model import Price
 from nautilus_trader.model import Symbol
 from nautilus_trader.model import Venue
 from nautilus_trader.model import YieldCurve
+from nautilus_trader.model import custom_data_backend_kind
 from nautilus_trader.model import register_custom_data_class
 from nautilus_trader.persistence import ParquetDataCatalog
 from nautilus_trader.persistence import RustTestCustomData
@@ -313,6 +314,187 @@ def test_migration_planner_resolves_funding_and_close_files(tmp_path: Path) -> N
     assert [item.to_dict() for item in target.query(NautilusDataType.InstrumentClose)] == [
         values["instrument_close"].to_dict(),
     ]
+
+
+def test_funding_rate_updates_round_trip(tmp_path: Path) -> None:
+    """
+    Verify funding rate updates round trip through the typed writer and query.
+    """
+    catalog = ParquetDataCatalog(str(tmp_path))
+    instrument_id = InstrumentId.from_str("ETHUSDT-PERP.BINANCE")
+    first = FundingRateUpdate(
+        instrument_id,
+        Decimal("0.000123456789012345"),
+        1_000,
+        1_001,
+        interval=480,
+        next_funding_ns=28_800_000_000_000,
+    )
+    second = FundingRateUpdate(instrument_id, Decimal("-0.0001"), 2_000, 2_001)
+
+    catalog.write_funding_rate_updates([first, second])
+
+    expected = [first.to_dict(), second.to_dict()]
+    assert [item.to_dict() for item in catalog.query_funding_rate_updates()] == expected
+    assert [item.to_dict() for item in catalog.query(NautilusDataType.FundingRateUpdate)] == (
+        expected
+    )
+    assert [
+        item.to_dict()
+        for item in catalog.query_funding_rate_updates(
+            identifiers=[str(instrument_id)],
+            start=1_500,
+        )
+    ] == [second.to_dict()]
+
+
+@pytest.mark.parametrize("kind", ["statuses", "closes"])
+@pytest.mark.parametrize(
+    ("query_kwargs", "expected_indices"),
+    [
+        ({}, [0, 1, 2, 3]),
+        ({"identifiers": ["ETHUSDT.BINANCE"]}, [0, 1, 3]),
+        ({"identifiers": ["BTCUSDT.BINANCE"]}, [2]),
+        ({"identifiers": ["MISSING.BINANCE"]}, []),
+        ({"start": 2_002}, [1, 2, 3]),
+        ({"end": 2_002}, [0, 1]),
+        ({"start": 2_002, "end": 2_002}, [1]),
+        (
+            {"identifiers": ["ETHUSDT.BINANCE"], "start": 1_500, "end": 2_600},
+            [1],
+        ),
+        ({"where_clause": "ts_event = TIMESTAMP '1970-01-01 00:00:00.000000200'"}, [1]),
+        ({"start": 4_000}, []),
+    ],
+)
+def test_instrument_typed_queries_match_generic_query(
+    tmp_path: Path,
+    kind: str,
+    query_kwargs: dict[str, Any],
+    expected_indices: list[int],
+) -> None:
+    """
+    Preserve every instrument status and close field through typed queries and filters.
+    """
+    catalog = ParquetDataCatalog(str(tmp_path))
+    first_id = InstrumentId.from_str("ETHUSDT.BINANCE")
+    second_id = InstrumentId.from_str("BTCUSDT.BINANCE")
+
+    if kind == "statuses":
+        data_type = NautilusDataType.InstrumentStatus
+        records = [
+            InstrumentStatus(
+                first_id,
+                MarketStatusAction.TRADING,
+                100,
+                1_001,
+                reason="Normal trading",
+                trading_event="MARKET_OPEN",
+                is_trading=True,
+                is_quoting=False,
+                is_short_sell_restricted=True,
+            ),
+            InstrumentStatus(
+                first_id,
+                MarketStatusAction.HALT,
+                200,
+                2_002,
+                reason="Trading halt",
+                trading_event="MARKET_HALT",
+                is_trading=False,
+                is_quoting=True,
+                is_short_sell_restricted=False,
+            ),
+            InstrumentStatus(second_id, MarketStatusAction.TRADING, 250, 2_504),
+            InstrumentStatus(
+                first_id,
+                MarketStatusAction.TRADING,
+                300,
+                3_003,
+                is_short_sell_restricted=False,
+            ),
+        ]
+    else:
+        data_type = NautilusDataType.InstrumentClose
+        records = [
+            InstrumentClose(
+                first_id,
+                Price.from_str("100.25"),
+                InstrumentCloseType.END_OF_SESSION,
+                100,
+                1_001,
+            ),
+            InstrumentClose(
+                first_id,
+                Price.from_str("101.375"),
+                InstrumentCloseType.CONTRACT_EXPIRED,
+                200,
+                2_002,
+            ),
+            InstrumentClose(
+                second_id,
+                Price.from_str("200.50"),
+                InstrumentCloseType.END_OF_SESSION,
+                250,
+                2_504,
+            ),
+            InstrumentClose(
+                first_id,
+                Price.from_str("102.5"),
+                InstrumentCloseType.END_OF_SESSION,
+                300,
+                3_003,
+            ),
+        ]
+
+    for record in records:
+        getattr(catalog, f"write_instrument_{kind}")([record])
+    expected = [records[index].to_dict() for index in expected_indices]
+    typed = getattr(catalog, f"query_instrument_{kind}")(**query_kwargs)
+    positional = getattr(catalog, f"query_instrument_{kind}")(
+        query_kwargs.get("identifiers"),
+        query_kwargs.get("start"),
+        query_kwargs.get("end"),
+        query_kwargs.get("where_clause"),
+    )
+    generic = catalog.query(data_type, **query_kwargs)
+
+    assert [type(item) for item in typed] == [type(records[0])] * len(expected)
+    assert [item.to_dict() for item in typed] == expected
+    assert [item.to_dict() for item in positional] == expected
+    assert [item.to_dict() for item in generic] == expected
+
+
+@pytest.mark.parametrize("kind", ["statuses", "closes"])
+def test_instrument_typed_queries_preserve_query_errors(tmp_path: Path, kind: str) -> None:
+    """
+    Report invalid SQL through the same I/O error boundary as generic queries.
+    """
+    catalog = ParquetDataCatalog(str(tmp_path))
+    instrument_id = InstrumentId.from_str("ETHUSDT.BINANCE")
+
+    if kind == "statuses":
+        data_type = NautilusDataType.InstrumentStatus
+        record = InstrumentStatus(instrument_id, MarketStatusAction.TRADING, 100, 1_001)
+    else:
+        data_type = NautilusDataType.InstrumentClose
+        record = InstrumentClose(
+            instrument_id,
+            Price.from_str("100.25"),
+            InstrumentCloseType.END_OF_SESSION,
+            100,
+            1_001,
+        )
+    getattr(catalog, f"write_instrument_{kind}")([record])
+
+    with pytest.raises(OSError, match="Failed to query data") as typed_error:
+        getattr(catalog, f"query_instrument_{kind}")(where_clause="nonexistent_column = 1")
+    with pytest.raises(OSError, match="Query failed") as generic_error:
+        catalog.query(data_type, where_clause="nonexistent_column = 1")
+
+    assert str(typed_error.value).removeprefix("Failed to query data: ") == str(
+        generic_error.value,
+    ).removeprefix("Query failed: ")
 
 
 @pytest.mark.parametrize("backend", ["parquet"])
@@ -843,6 +1025,91 @@ def test_yield_curve_custom_data_round_trip(tmp_path: Path) -> None:
         assert value.ts_event == 23
         assert value.ts_init == 29
     assert not hasattr(NautilusRecordType, "YieldCurve")
+
+
+@pytest.mark.parametrize("portfolio", [False, True])
+def test_calculated_greeks_custom_data_round_trip(tmp_path: Path, portfolio: bool) -> None:
+    """
+    Preserve native calculated Greeks and their routing identity through custom data.
+    """
+    greeks = GreeksData.from_delta(InstrumentId.from_str("ES.GLBX"), 1.25, 8.0, 11)
+    value = greeks.to_portfolio_greeks() if portfolio else greeks
+    name = type(value).__name__
+    identifier = "DELTA-HEDGE-001" if portfolio else str(greeks.instrument_id)
+    data_type = DataType(name, {"source": "calculator", "scenario": "base"}, identifier)
+    original = CustomData(data_type, value)
+    expected = json.loads(original.to_json_bytes())
+    catalog = _catalog(tmp_path, "parquet")
+
+    catalog.write_custom_data([original])
+    [loaded] = catalog.query_custom_data(
+        NautilusDataType.Custom(name),
+        identifiers=[identifier],
+    )
+    restored = CustomData.from_json_bytes(loaded.to_json_bytes())
+
+    assert custom_data_backend_kind(original) == "native"
+    for item in (loaded, restored):
+        assert custom_data_backend_kind(item) == "native"
+        assert type(item.data) is type(value)
+        assert item.data_type == data_type
+        assert json.loads(item.to_json_bytes()) == expected
+        assert item.ts_event == 11
+        assert item.ts_init == 11
+
+
+@pytest.mark.parametrize("kind", ["GreeksData", "PortfolioGreeks", "YieldCurve"])
+@pytest.mark.parametrize("identifier", [None, "GREEKS-INPUT"])
+def test_greeks_custom_stream_preserves_catalog_identifier(
+    tmp_path: Path,
+    kind: str,
+    identifier: str | None,
+) -> None:
+    """
+    Promote custom Greeks streams under their explicit catalog identity.
+    """
+    greeks = [
+        GreeksData.from_delta(InstrumentId.from_str(instrument), delta, 8.0, timestamp)
+        for instrument, delta, timestamp in [
+            ("ES.GLBX", 1.25, 11),
+            ("NQ.GLBX", 2.5, 21),
+            ("ES.GLBX", 3.75, 31),
+            ("NQ.GLBX", 5.0, 41),
+        ]
+    ]
+    values = {
+        "GreeksData": greeks,
+        "PortfolioGreeks": [value.to_portfolio_greeks() for value in greeks],
+        "YieldCurve": [
+            YieldCurve("USD", [0.0], [rate], timestamp - 1, timestamp)
+            for rate, timestamp in [(0.04, 11), (0.05, 21), (0.06, 31), (0.07, 41)]
+        ],
+    }[kind]
+    data_type = DataType(kind, {"source": "stream", "scenario": "base"}, identifier)
+    originals = [CustomData(data_type, value) for value in values]
+    expected = [json.loads(item.to_json_bytes()) for item in originals]
+    staging = tmp_path / "backtest" / "greeks-run"
+    staging.mkdir(parents=True)
+    writer = StreamingFeatherWriter(str(staging), cache=Cache(), clock=Clock.new_test())
+    for item in originals:
+        writer.write(item)
+    writer.close()
+    catalog = ParquetDataCatalog(str(tmp_path))
+
+    catalog.convert_stream_to_data("greeks-run", NautilusDataType.Custom(kind))
+    loaded = catalog.query_custom_data(
+        NautilusDataType.Custom(kind),
+        identifiers=[identifier] if identifier is not None else None,
+    )
+    expected_directory = tmp_path / "data" / "custom" / kind
+    if identifier is not None:
+        expected_directory /= identifier
+
+    assert [path.parent for path in tmp_path.rglob("*.parquet")] == [expected_directory]
+    assert len(loaded) == 4
+    assert [custom_data_backend_kind(item) for item in loaded] == ["native"] * 4
+    assert [item.data_type for item in loaded] == [data_type] * 4
+    assert [json.loads(item.to_json_bytes()) for item in loaded] == expected
 
 
 def test_cache_rejects_yield_curve_decoded_without_points() -> None:

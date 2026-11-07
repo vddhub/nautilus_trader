@@ -16,8 +16,9 @@
 //! Provider outcome IDs retain their spelling under separate FinFeed venues.
 
 use nautilus_model::identifiers::{InstrumentId, Symbol, Venue};
+use ustr::Ustr;
 
-use crate::http::error::Error;
+use crate::{common::enums::Exchange, http::error::Error};
 
 const VENUE_PREFIX: &str = "FINFEED_";
 
@@ -29,7 +30,9 @@ const VENUE_PREFIX: &str = "FINFEED_";
 ///
 /// Returns an error if the exchange is unknown or the outcome ID is invalid.
 pub fn to_instrument_id(exchange_id: &str, market_id: &str) -> Result<InstrumentId, Error> {
-    validate_exchange_id(exchange_id)?;
+    exchange_id
+        .parse::<Exchange>()
+        .map_err(|_| Error::Validation(format!("unknown exchange {exchange_id}")))?;
 
     if matches!(market_id, "." | "..") {
         return Err(Error::Validation("invalid outcome ID".into()));
@@ -47,7 +50,7 @@ pub fn to_instrument_id(exchange_id: &str, market_id: &str) -> Result<Instrument
 /// # Errors
 ///
 /// Returns an error if the instrument does not use a known FinFeed venue or valid outcome ID.
-pub fn from_instrument_id(instrument_id: InstrumentId) -> Result<(String, String), Error> {
+pub fn from_instrument_id(instrument_id: InstrumentId) -> Result<(Ustr, Ustr), Error> {
     let exchange_id = instrument_id
         .venue
         .as_str()
@@ -55,26 +58,7 @@ pub fn from_instrument_id(instrument_id: InstrumentId) -> Result<(String, String
         .ok_or_else(|| Error::Validation("instrument does not use a FinFeed venue".into()))?;
     let market_id = instrument_id.symbol.as_str();
     to_instrument_id(exchange_id, market_id)?;
-    Ok((exchange_id.to_owned(), market_id.to_owned()))
-}
-
-pub(crate) fn validate_exchange_id(exchange_id: &str) -> Result<(), Error> {
-    if !matches!(
-        exchange_id,
-        "KALSHI"
-            | "POLYMARKET"
-            | "MYRIAD"
-            | "MANIFOLD"
-            | "HYPERLIQUIDOUTCOME"
-            | "PASCAL"
-            | "GEMINIPM"
-            | "CRYPTOCOMPM"
-            | "FORECASTEX"
-    ) {
-        return Err(Error::Validation(format!("unknown exchange {exchange_id}")));
-    }
-
-    Ok(())
+    Ok((exchange_id.into(), market_id.into()))
 }
 
 #[cfg(test)]
@@ -109,7 +93,7 @@ mod tests {
             assert_eq!(reparsed, id);
             assert_eq!(
                 from_instrument_id(reparsed).unwrap(),
-                (exchange.to_owned(), market_id)
+                (exchange.into(), market_id)
             );
         }
     }

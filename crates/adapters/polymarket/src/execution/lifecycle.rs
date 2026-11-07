@@ -377,6 +377,7 @@ impl PolymarketExecutionClient {
                 Some(venue_order_id),
                 "Polymarket modification was interrupted during shutdown",
                 ts_event,
+                None,
             );
 
             if let Some(cancel_ts) = cancel_ts
@@ -631,9 +632,8 @@ impl PolymarketExecutionClient {
     }
 
     pub(super) fn get_neg_risk(&self, instrument_id: &InstrumentId) -> bool {
-        self.neg_risk_index
-            .get_cloned(instrument_id)
-            .unwrap_or(false)
+        self.flush_pending_instruments();
+        Self::get_neg_risk_from_snapshot(&self.neg_risk_index.load(), instrument_id)
     }
 
     /// Spawns the task that performs targeted terminal REST reads for quarantined and
@@ -748,6 +748,7 @@ impl PolymarketExecutionClient {
     }
 
     pub(super) fn load_instruments_from_cache(&self) {
+        self.flush_pending_instruments();
         let cache = self.core.cache();
         let instruments: Vec<InstrumentAny> = cache
             .instruments(&self.core.venue, None)
@@ -762,6 +763,16 @@ impl PolymarketExecutionClient {
         );
 
         log::debug!("Loaded {} instruments from cache", instruments.len());
+    }
+
+    pub(super) fn flush_pending_instruments(&self) {
+        if let Some(instruments) = self.instruments_pending.take() {
+            upsert_execution_lookups(
+                &self.shared_token_instruments,
+                &self.neg_risk_index,
+                &instruments,
+            );
+        }
     }
 
     pub(super) fn load_orders_from_cache(&self) {
@@ -915,6 +926,7 @@ impl PolymarketExecutionClient {
         self.clear_settlement_observers();
         self.shared_token_instruments.store(AHashMap::new());
         self.neg_risk_index.store(AHashMap::new());
+        *self.instruments_pending.get_mut() = Some(Vec::new());
         self.collateral_locks.lock().clear_session();
         self.ws_dispatch_state.lock().reset_session();
         self.settlement.clear();
@@ -1848,8 +1860,8 @@ mod tests {
         messages::{
             ExecutionEvent,
             execution::{
-                CancelAllOrders, GenerateFillReportsBuilder, ModifyOrder, SubmitOrder,
-                SubmitOrderList,
+                CancelAllOrders, GenerateFillReportsBuilder, GenerateOrderStatusReportBuilder,
+                GenerateOrderStatusReportsBuilder, ModifyOrder, SubmitOrder, SubmitOrderList,
             },
         },
         msgbus::{publish_order_event, publish_position_event, switchboard},
@@ -1877,7 +1889,10 @@ mod tests {
             LimitOrder, Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs,
         },
         position::Position,
-        types::{Currency, Money, Price, Price as ModelPrice, Quantity, Quantity as ModelQuantity},
+        types::{
+            AccountBalance, Currency, Money, Price, Price as ModelPrice, Quantity,
+            Quantity as ModelQuantity,
+        },
     };
     use rstest::rstest;
     use serde_json::Value;
@@ -1885,15 +1900,21 @@ mod tests {
     use super::*;
     use crate::{
         common::enums::PolymarketTradeStatus,
-        execution::settlement::{
-            AdmittedLeg,
-            admission::AdmittedTrade,
-            registry::tests::{
-                force_client_fault, force_trade_fault, leg_application, trade_hard_fault,
+        execution::{
+            collateral::AppliedBalance,
+            settlement::{
+                AdmittedLeg,
+                admission::AdmittedTrade,
+                registry::{
+                    CollectedFillReports,
+                    tests::{
+                        force_client_fault, force_trade_fault, leg_application, trade_hard_fault,
+                    },
+                },
+                state::LegApplication,
             },
-            state::LegApplication,
         },
-        factories::spawn_rejecting_proxy,
+        factories::proxy::spawn_rejecting_proxy,
     };
 
     const TEST_PRIVATE_KEY: &str =
@@ -2158,9 +2179,17 @@ mod tests {
 
     #[rstest]
     fn load_instruments_from_cache_preloads_expired_execution_lookup_state() {
-        let (client, cache) = test_client();
+        let (mut client, cache) = test_client();
         let active = test_binary_option("0xACTIVE", false, false);
         let expired = test_binary_option("0xEXPIRED", true, true);
+        let pending = test_binary_option("0xPENDING", false, true);
+
+        for instrument in [&active, &expired, &pending] {
+            client.on_instrument(instrument.clone());
+        }
+
+        assert!(client.shared_token_instruments.is_empty());
+        assert!(client.neg_risk_index.is_empty());
 
         {
             let mut cache = cache.borrow_mut();
@@ -2170,10 +2199,10 @@ mod tests {
 
         client.load_instruments_from_cache();
 
-        assert_eq!(client.shared_token_instruments.len(), 2);
-        assert_eq!(client.neg_risk_index.len(), 2);
+        assert_eq!(client.shared_token_instruments.len(), 3);
+        assert_eq!(client.neg_risk_index.len(), 3);
 
-        for (instrument, neg_risk) in [(&active, false), (&expired, true)] {
+        for (instrument, neg_risk) in [(&active, false), (&expired, true), (&pending, true)] {
             assert_eq!(
                 serde_json::to_value(
                     client
@@ -3116,10 +3145,6 @@ mod tests {
 
     #[rstest]
     fn buy_fill_reduces_free_until_drained_refresh() {
-        use nautilus_model::types::AccountBalance;
-
-        use crate::execution::collateral::AppliedBalance;
-
         let (mut client, cache) = test_client();
         let instrument = test_binary_option("0xUNSETTLED_BUY", false, false);
         cache
@@ -3197,10 +3222,6 @@ mod tests {
 
     #[rstest]
     fn load_orders_from_cache_keeps_unsettled_buy_spend() {
-        use nautilus_model::types::AccountBalance;
-
-        use crate::execution::collateral::AppliedBalance;
-
         let (mut client, cache) = test_client();
         let instrument = test_binary_option("0xRECONNECT_BUY", false, false);
         cache
@@ -3273,10 +3294,6 @@ mod tests {
 
     #[rstest]
     fn terminal_rest_buy_fill_is_not_locked() {
-        use nautilus_model::types::AccountBalance;
-
-        use crate::execution::collateral::AppliedBalance;
-
         let (mut client, cache) = test_client();
         let instrument = test_binary_option("0xREST_BUY", false, false);
         cache
@@ -3358,10 +3375,6 @@ mod tests {
 
     #[rstest]
     fn confirmed_fill_report_is_not_locked() {
-        use nautilus_model::types::AccountBalance;
-
-        use crate::execution::collateral::AppliedBalance;
-
         let (mut client, cache) = test_client();
         let instrument = test_binary_option("0xREPORT_BUY", false, false);
         cache
@@ -3384,10 +3397,18 @@ mod tests {
             ts_event: UnixNanos::from(19_000_000_000_u64),
         };
 
-        client
+        let report = client
             .settlement
             .build_fill_report("REPORT-BUY", &leg, UnixNanos::from(1))
             .unwrap();
+        client
+            .settlement
+            .accept_fill_reports(&CollectedFillReports {
+                reports: vec![report],
+                venue_trade_ids: ahash::AHashMap::from_iter([(trade_id, "REPORT-BUY".to_string())]),
+            })
+            .unwrap();
+
         let ticket = client
             .collateral_locks
             .lock()
@@ -3453,10 +3474,6 @@ mod tests {
 
     #[rstest]
     fn sell_fill_does_not_lock_unsettled_collateral() {
-        use nautilus_model::types::AccountBalance;
-
-        use crate::execution::collateral::AppliedBalance;
-
         let (mut client, cache) = test_client();
         let instrument = test_binary_option("0xSELL_FILL", false, false);
         cache
@@ -3699,13 +3716,10 @@ mod tests {
 
     #[rstest]
     fn reset_clears_subscriptions_and_lookup_state() {
-        use nautilus_model::types::AccountBalance;
-
-        use crate::execution::collateral::AppliedBalance;
-
         let (mut client, _cache) = test_client();
         let expired = test_binary_option("0xRESET", true, true);
         client.upsert_execution_lookup(&expired);
+        client.on_instrument(expired.clone());
         client.ensure_order_event_subscription();
         client.ensure_position_event_subscription();
         client.settlement.quarantine_invalid_trade("trade-1");
@@ -3724,6 +3738,7 @@ mod tests {
         }
 
         client.reset_client();
+        client.flush_pending_instruments();
 
         let ticket = client
             .collateral_locks
@@ -3943,12 +3958,15 @@ mod tests {
             None,
             None,
         );
+        let cause = modify.command_id;
         client.modify_order(modify).unwrap();
         let rejected = rx.try_recv().unwrap();
 
-        let ExecutionEvent::Order(OrderEventAny::ModifyRejected(rejected)) = rejected else {
-            panic!("Expected ModifyRejected, was {rejected:?}");
+        let ExecutionEvent::Order(OrderEventAny::ModifyDenied(rejected)) = rejected else {
+            panic!("Expected ModifyDenied, was {rejected:?}");
         };
+
+        assert_eq!(rejected.causation_id, Some(cause));
 
         let cancel = CancelAllOrders::new(
             order.trader_id(),
@@ -4030,9 +4048,22 @@ mod tests {
             .ts_init(UnixNanos::default())
             .build()
             .unwrap();
+        let order_reports_cmd = GenerateOrderStatusReportsBuilder::default()
+            .ts_init(UnixNanos::default())
+            .open_only(false)
+            .build()
+            .unwrap();
+        let order_report_cmd = GenerateOrderStatusReportBuilder::default()
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
 
         let mass_status = client.generate_mass_status(None).await;
         let fill_reports = client.generate_fill_reports(fill_reports_cmd).await;
+        let order_reports = client
+            .generate_order_status_reports(&order_reports_cmd)
+            .await;
+        let order_report = client.generate_order_status_report(&order_report_cmd).await;
 
         assert_eq!(
             mass_status.unwrap_err().to_string(),
@@ -4043,6 +4074,16 @@ mod tests {
             fill_reports.unwrap_err().to_string(),
             "cannot generate fill reports: Polymarket settlement registry holds 1 record(s) \
              with unresolved evidence"
+        );
+        assert_eq!(
+            order_reports.unwrap_err().to_string(),
+            "cannot generate order status reports: Polymarket settlement registry holds 1 \
+             record(s) with unresolved evidence"
+        );
+        assert_eq!(
+            order_report.unwrap_err().to_string(),
+            "cannot generate order status report: Polymarket settlement registry holds 1 \
+             record(s) with unresolved evidence"
         );
     }
 

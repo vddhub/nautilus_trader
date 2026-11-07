@@ -23,6 +23,7 @@ use std::{
 
 use nautilus_core::string::secret::SecretString;
 use nautilus_network::{
+    ConnectionUrl,
     backoff::ExponentialBackoff,
     dst::time,
     http::{HttpClient, HttpRedirectPolicy, Method},
@@ -35,6 +36,7 @@ use serde::{
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use ustr::Ustr;
 
 use super::{
     error::Error,
@@ -68,11 +70,13 @@ pub const REST_URL: &str = "https://api.prediction-markets.finfeedapi.com/v1/";
 /// Request timeouts, pacing, retry deadlines, and maximum backoff are positive and limited
 /// locally to one day. Both retry deadlines are required.
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(SecretString, into))]
 #[serde(default, deny_unknown_fields)]
 pub struct FinFeedHttpConfig {
     /// HTTPS endpoint, or a plaintext loopback test peer, including the version prefix.
+    /// Debug output redacts the complete endpoint.
     #[builder(default = FinFeedHttpConfig::default().base_url)]
-    pub base_url: String,
+    pub base_url: SecretString,
     /// Explicit HTTP(S) proxy, with ambient proxies disabled.
     pub proxy_url: Option<SecretString>,
     /// Transport timeout for one request, in seconds.
@@ -102,13 +106,14 @@ impl Default for FinFeedHttpConfig {
         Self {
             base_url: REST_URL.into(),
             proxy_url: None,
-            timeout_secs: 30,
+            timeout_secs: 300,
             max_concurrent_requests: 1,
             attempt_budget: 100,
             min_request_interval_ms: 10_000,
             retry: RetryConfig {
                 jitter_ms: 0,
-                max_elapsed_ms: Some(120_000),
+                operation_timeout_ms: Some(330_000),
+                max_elapsed_ms: Some(600_000),
                 ..RetryConfig::default()
             },
         }
@@ -123,7 +128,7 @@ impl Default for FinFeedHttpConfig {
 #[derive(Debug)]
 pub struct FinFeedHttpClient {
     client: HttpClient,
-    base_url: Url,
+    base_url: ConnectionUrl,
     api_key: SecretString,
     concurrency: tokio::sync::Semaphore,
     next_request: tokio::sync::Mutex<Option<time::Instant>>,
@@ -142,7 +147,7 @@ impl FinFeedHttpClient {
     /// or transport construction fails.
     pub fn new(api_key: Option<SecretString>, config: FinFeedHttpConfig) -> Result<Self, Error> {
         let api_key = resolve_api_key(api_key)?;
-        let mut base_url = Url::parse(&config.base_url)
+        let mut base_url = Url::parse(config.base_url.expose_secret())
             .map_err(|_| Error::Validation("invalid base URL".into()))?;
 
         let loopback = base_url.host_str().is_some_and(|host| {
@@ -159,7 +164,10 @@ impl FinFeedHttpClient {
             || base_url.password().is_some()
             || base_url.query().is_some()
             || base_url.fragment().is_some()
-            || config.base_url.contains(api_key.expose_secret())
+            || config
+                .base_url
+                .expose_secret()
+                .contains(api_key.expose_secret())
         {
             return Err(Error::Validation(
                 "base URL must be HTTPS or loopback HTTP without credentials, query, or fragment"
@@ -203,7 +211,7 @@ impl FinFeedHttpClient {
             .build()?;
         Ok(Self {
             client,
-            base_url,
+            base_url: base_url.as_str().into(),
             api_key,
             concurrency: tokio::sync::Semaphore::new(config.max_concurrent_requests),
             next_request: tokio::sync::Mutex::new(None),
@@ -282,9 +290,9 @@ impl FinFeedHttpClient {
         &self,
         exchange_id: &str,
         query: &ActiveQuery,
-    ) -> Result<Vec<String>, Error> {
+    ) -> Result<Vec<Ustr>, Error> {
         query.validate()?;
-        let ids: Vec<String> = self.get(&["markets", exchange_id, "active"], query).await?;
+        let ids: Vec<Ustr> = self.get(&["markets", exchange_id, "active"], query).await?;
         check_page(ids.len(), query.limit)?;
         Ok(ids)
     }
@@ -594,7 +602,7 @@ impl FinFeedHttpClient {
         exchange_id: &str,
         query: &ActiveQuery,
         bounds: Pagination,
-    ) -> Result<Vec<String>, Error> {
+    ) -> Result<Vec<Ustr>, Error> {
         query.validate()?;
         bounds.validate()?;
         let mut query = query.clone();
@@ -612,7 +620,7 @@ impl FinFeedHttpClient {
             }
 
             for id in page {
-                if id.is_empty() || !seen.insert(id.clone()) {
+                if id.is_empty() || !seen.insert(id) {
                     return Err(Error::Response("active ID is empty or repeated"));
                 }
 
@@ -643,7 +651,8 @@ impl FinFeedHttpClient {
             ));
         }
 
-        let mut url = self.base_url.clone();
+        let mut url = Url::parse(self.base_url.expose())
+            .map_err(|_| Error::Validation("invalid base URL".into()))?;
         url.path_segments_mut()
             .map_err(|()| Error::Validation("invalid base URL path".into()))?
             .pop_if_empty()

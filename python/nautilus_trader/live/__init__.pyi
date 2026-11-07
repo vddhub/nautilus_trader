@@ -352,6 +352,14 @@ class _ClientOutput:
     def order_accepted(
         self, order: typing.Any, venue_order_id: model.VenueOrderId, ts_event: int, ts_init: int
     ) -> None: ...
+    def order_modify_denied(
+        self,
+        order: typing.Any,
+        reason: str,
+        ts_event: int,
+        ts_init: int,
+        causation_id: core.UUID4 | None = None,
+    ) -> None: ...
     def order_modify_rejected(
         self,
         order: typing.Any,
@@ -359,6 +367,15 @@ class _ClientOutput:
         reason: str,
         ts_event: int,
         ts_init: int,
+        causation_id: core.UUID4 | None = None,
+    ) -> None: ...
+    def order_cancel_denied(
+        self,
+        order: typing.Any,
+        reason: str,
+        ts_event: int,
+        ts_init: int,
+        causation_id: core.UUID4 | None = None,
     ) -> None: ...
     def order_cancel_rejected(
         self,
@@ -367,6 +384,7 @@ class _ClientOutput:
         reason: str,
         ts_event: int,
         ts_init: int,
+        causation_id: core.UUID4 | None = None,
     ) -> None: ...
     def order_updated(
         self,
@@ -748,7 +766,7 @@ class LiveExecutionEngineConfig:
         inflight_check_threshold_ms: int | None = None,
         inflight_check_retries: int | None = None,
         open_check_interval_secs: float | None = None,
-        open_check_lookback_mins: int | None = None,
+        open_check_lookback_mins: int | None = ...,
         open_check_threshold_ms: int | None = None,
         open_check_missing_retries: int | None = None,
         open_check_open_only: bool | None = None,

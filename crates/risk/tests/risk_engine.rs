@@ -97,7 +97,7 @@ use nautilus_model::{
     orders::{Order, OrderAny, OrderList, OrderTestBuilder},
     position::Position,
     types::{
-        AccountBalance, Currency, MONEY_MAX, Money, Price, Quantity,
+        AccountBalance, Currency, MONEY_MAX, MarginBalance, Money, Price, Quantity,
         fixed::{FIXED_PRECISION, check_fixed_precision},
         money::MONEY_RAW_MAX,
     },
@@ -6692,7 +6692,7 @@ fn test_submit_order_for_emulation_sends_command_to_emulator() {}
 
 // MODIFY ORDER TESTS
 #[rstest]
-fn test_modify_order_when_no_order_found_logs_error(
+fn test_modify_order_when_no_order_found_emits_correlated_denial(
     strategy_id_ema_cross: StrategyId,
     client_id_binance: ClientId,
     trader_id: TraderId,
@@ -6731,11 +6731,24 @@ fn test_modify_order_when_no_order_found_logs_error(
         None, // correlation_id
     );
 
+    let command_id = modify_order.command_id;
     risk_engine.execute(TradingCommand::ModifyOrder(modify_order));
 
     let saved_process_messages =
         get_process_order_event_handler_messages(&process_order_event_handler);
-    assert_eq!(saved_process_messages.len(), 0);
+    assert_eq!(saved_process_messages.len(), 1);
+
+    let OrderEventAny::ModifyDenied(event) = &saved_process_messages[0] else {
+        panic!("Expected modify denial");
+    };
+
+    assert_eq!(event.causation_id, Some(command_id));
+    assert_eq!(event.client_order_id, client_order_id);
+    assert_eq!(event.strategy_id, strategy_id_ema_cross);
+    assert_eq!(event.instrument_id, instrument_audusd.id());
+    assert_eq!(event.reason, "Order not found in cache");
+    assert_eq!(event.venue_order_id, None);
+    assert_eq!(event.account_id, None);
 }
 
 #[rstest]
@@ -6808,7 +6821,7 @@ fn test_modify_order_beyond_rate_limit_then_rejects(
         get_process_order_event_handler_messages(&process_order_event_handler);
     assert_eq!(saved_process_messages.len(), 6);
     let first_message = saved_process_messages.first().unwrap();
-    assert_eq!(first_message.event_type(), OrderEventType::ModifyRejected);
+    assert_eq!(first_message.event_type(), OrderEventType::ModifyDenied);
     assert_eq!(
         first_message.message().unwrap(),
         Ustr::from("Exceeded MAX_ORDER_MODIFY_RATE")
@@ -7005,7 +7018,7 @@ fn test_risk_rejects_when_checks_cannot_complete(
         if path == "submit" {
             OrderEventType::Denied
         } else {
-            OrderEventType::ModifyRejected
+            OrderEventType::ModifyDenied
         }
     );
     assert!(commands.is_empty());
@@ -7021,6 +7034,7 @@ fn test_risk_rejects_when_checks_cannot_complete(
 #[case::missing_rate("100 EUR", "empty", true)]
 #[case::disconnected_rate("100 EUR", "disconnected", true)]
 #[case::conversion_overflow("100 EUR", "overflow", true)]
+#[case::alternate_rate("100 EUR", "alternate", false)]
 fn test_order_risk_in_account_base_currency(
     #[case] balance: &str,
     #[case] rate: &str,
@@ -7060,34 +7074,38 @@ fn test_order_risk_in_account_base_currency(
     cache.add_account(account).unwrap();
 
     if rate != "empty" {
-        let instrument = InstrumentAny::CurrencyPair(default_fx_ccy(
-            Symbol::from(if rate == "disconnected" {
-                "AUD/USD"
-            } else {
-                "USDT/EUR"
-            }),
-            Some(Venue::from("BINANCE")),
-        ));
-        cache.add_instrument(instrument.clone()).unwrap();
-        cache
-            .add_quote(QuoteTick::new(
-                instrument.id(),
-                Price::from(if rate == "overflow" {
-                    "1000000.00000"
-                } else {
-                    "0.90000"
-                }),
-                Price::from(if rate == "overflow" {
-                    "1000000.00000"
-                } else {
-                    "0.95000"
-                }),
-                Quantity::from("1"),
-                Quantity::from("1"),
-                UnixNanos::default(),
-                UnixNanos::default(),
-            ))
-            .unwrap();
+        let pairs: &[(&str, &str, &str)] = match rate {
+            "disconnected" => &[("AUD/USD", "0.90000", "0.95000")],
+            "overflow" => &[("USDT/EUR", "1000000.00000", "1000000.00000")],
+            "alternate" => &[
+                ("USDT/AUD", "1000000000", "1000000000"),
+                ("AUD/CAD", "1000000000", "1000000000"),
+                ("CAD/CHF", "1000000000", "1000000000"),
+                ("CHF/EUR", "1000000000", "1000000000"),
+                ("USDT/GBP", "0.90000", "0.95000"),
+                ("GBP/EUR", "1.00000", "1.00000"),
+            ],
+            _ => &[("USDT/EUR", "0.90000", "0.95000")],
+        };
+
+        for &(symbol, bid, ask) in pairs {
+            let instrument = InstrumentAny::CurrencyPair(default_fx_ccy(
+                Symbol::from(symbol),
+                Some(Venue::from("BINANCE")),
+            ));
+            cache.add_instrument(instrument.clone()).unwrap();
+            cache
+                .add_quote(QuoteTick::new(
+                    instrument.id(),
+                    Price::from(bid),
+                    Price::from(ask),
+                    Quantity::from("1"),
+                    Quantity::from("1"),
+                    UnixNanos::default(),
+                    UnixNanos::default(),
+                ))
+                .unwrap();
+        }
     }
 
     let mut order = OrderTestBuilder::new(OrderType::Limit)
@@ -7202,7 +7220,7 @@ fn test_order_risk_in_account_base_currency(
             if path == "submit" {
                 OrderEventType::Denied
             } else {
-                OrderEventType::ModifyRejected
+                OrderEventType::ModifyDenied
             }
         );
         assert!(commands.is_empty());
@@ -7325,7 +7343,7 @@ fn test_modify_priced_order_uses_limit_for_risk(
             }
         };
 
-        assert_modify_rejected(&events, std::slice::from_ref(&order), &reason.to_string());
+        assert_modify_denied(&events, std::slice::from_ref(&order), &reason.to_string());
         assert!(commands.is_empty());
     } else {
         assert!(events.is_empty());
@@ -7419,7 +7437,7 @@ fn test_modify_market_to_limit_credits_unpriced_original_at_market(
             }
         };
 
-        assert_modify_rejected(&events, std::slice::from_ref(&order), &reason.to_string());
+        assert_modify_denied(&events, std::slice::from_ref(&order), &reason.to_string());
         assert!(commands.is_empty());
     } else {
         assert!(events.is_empty());
@@ -7497,7 +7515,7 @@ fn test_priced_trailing_limit_validates_offset_without_trigger(
     if rejected {
         let reason = OrderDeniedReason::UnsupportedTrailingOffsetType { offset_type }.to_string();
         if modify {
-            assert_modify_rejected(&events, std::slice::from_ref(&order), &reason);
+            assert_modify_denied(&events, std::slice::from_ref(&order), &reason);
         } else {
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].event_type(), OrderEventType::Denied);
@@ -7604,7 +7622,7 @@ fn test_modify_order_rechecks_max_notional(
             }
         };
 
-        assert_modify_rejected(&events, std::slice::from_ref(&order), &reason.to_string());
+        assert_modify_denied(&events, std::slice::from_ref(&order), &reason.to_string());
         assert!(commands.is_empty());
     }
 
@@ -7772,7 +7790,7 @@ fn test_modify_order_checks_cash_increase(
     let commands = get_execute_order_event_handler_messages(&execute_order_event_handler);
 
     if let Some(notional) = denied_notional {
-        assert_modify_rejected(
+        assert_modify_denied(
             &events,
             std::slice::from_ref(&order),
             &OrderDeniedReason::NotionalExceedsFreeBalance {
@@ -8716,7 +8734,7 @@ fn test_batch_modify_orders_checks_cumulative_cash_increase(
             }
         };
 
-        assert_modify_rejected(&events, &orders, &reason.to_string());
+        assert_modify_denied(&events, &orders, &reason.to_string());
         assert!(commands.is_empty());
     } else {
         assert!(events.is_empty());
@@ -8768,7 +8786,7 @@ fn test_modify_order_checks_margin_increase(
     let commands = get_execute_order_event_handler_messages(&execute_order_event_handler);
 
     if let Some(margin) = denied_margin {
-        assert_modify_rejected(
+        assert_modify_denied(
             &events,
             &[order],
             &OrderDeniedReason::InitialMarginExceedsFreeBalance {
@@ -8839,7 +8857,7 @@ fn test_batch_modify_orders_checks_cumulative_margin_increase(
     let commands = get_execute_order_event_handler_messages(&execute_order_event_handler);
 
     if let Some(margin) = denied_margin {
-        assert_modify_rejected(
+        assert_modify_denied(
             &events,
             &orders,
             &OrderDeniedReason::CumulativeInitialMarginExceedsFreeBalance {
@@ -8936,7 +8954,7 @@ fn test_modify_order_checks_asset_increase(
     let commands = get_execute_order_event_handler_messages(&execute_order_event_handler);
 
     if denied {
-        assert_modify_rejected(
+        assert_modify_denied(
             &events,
             &[order],
             &OrderDeniedReason::CumulativeNotionalExceedsFreeBalance {
@@ -9008,7 +9026,7 @@ fn test_modify_order_preserves_position_reducing_checks(
     let commands = get_execute_order_event_handler_messages(&execute_order_event_handler);
 
     if denied {
-        assert_modify_rejected(
+        assert_modify_denied(
             &events,
             &[order],
             &OrderDeniedReason::InitialMarginExceedsFreeBalance {
@@ -9047,32 +9065,35 @@ fn test_modify_order_risk_rejection_restores_pending_update(
             .build(),
         AccountId::from("SIM-001"),
     );
-    order
-        .apply(OrderEventAny::PendingUpdate(OrderPendingUpdate::new(
-            order.trader_id(),
-            order.strategy_id(),
-            order.instrument_id(),
-            order.client_order_id(),
-            order.account_id(),
-            UUID4::new(),
-            UnixNanos::default(),
-            UnixNanos::default(),
-            false,
-            order.venue_order_id(),
-        )))
-        .unwrap();
+    let command = modify_command(&order, Some(Quantity::from("2000")), None, None);
+
+    let mut pending = OrderPendingUpdate::new(
+        order.trader_id(),
+        order.strategy_id(),
+        order.instrument_id(),
+        order.client_order_id(),
+        order.account_id(),
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        false,
+        order.venue_order_id(),
+    );
+    pending.causation_id = Some(command.command_id);
+    order.apply(OrderEventAny::PendingUpdate(pending)).unwrap();
     cache.add_order(order.clone(), None, None, true).unwrap();
     let mut risk_engine = get_risk_engine(Some(Rc::new(RefCell::new(cache))), None, None, false);
     risk_engine.set_max_notional_per_order(order.instrument_id(), dec!(1000));
 
-    risk_engine.execute(TradingCommand::ModifyOrder(modify_command(
-        &order,
-        Some(Quantity::from("2000")),
-        None,
-        None,
-    )));
+    risk_engine.execute(TradingCommand::ModifyOrder(command.clone()));
     let events = get_process_order_event_handler_messages(&process_order_event_handler);
     assert_eq!(events.len(), 1);
+
+    let OrderEventAny::ModifyDenied(denied) = &events[0] else {
+        panic!("Expected modify denial");
+    };
+
+    assert_eq!(denied.causation_id, Some(command.command_id));
     order.apply(events[0].clone()).unwrap();
 
     assert_eq!(order.status(), OrderStatus::Accepted);
@@ -9185,7 +9206,7 @@ fn test_modify_order_checks_betting_liability_increase(
     let commands = get_execute_order_event_handler_messages(&execute_order_event_handler);
 
     if denied {
-        assert_modify_rejected(
+        assert_modify_denied(
             &events,
             &[order],
             &OrderDeniedReason::NotionalExceedsFreeBalance {
@@ -9446,7 +9467,7 @@ fn test_modify_trailing_order_rejects_calculation_failure(
         OrderDeniedReason::UnsupportedTrailingOffsetType { offset_type }
     };
 
-    assert_modify_rejected(&events, &[order], &reason.to_string());
+    assert_modify_denied(&events, &[order], &reason.to_string());
     assert!(get_execute_order_event_handler_messages(&execute_order_event_handler).is_empty());
 }
 
@@ -9513,7 +9534,7 @@ fn test_modify_orders_reject_invalid_notional_limit(
 
     risk.execute(command);
 
-    assert_modify_rejected(
+    assert_modify_denied(
         &get_process_order_event_handler_messages(&process_order_event_handler),
         &orders,
         &OrderDeniedReason::InvalidMaxNotionalPerOrder {
@@ -9651,7 +9672,7 @@ fn test_batch_modify_orders_reserves_closing_capacity(
             }
         };
 
-        assert_modify_rejected(&events, &orders, &reason.to_string());
+        assert_modify_denied(&events, &orders, &reason.to_string());
         assert!(commands.is_empty());
     } else {
         assert!(events.is_empty());
@@ -9741,7 +9762,7 @@ fn test_modify_cash_order_credits_only_open_exposure(
     let commands = get_execute_order_event_handler_messages(&execute_order_event_handler);
 
     if denied {
-        assert_modify_rejected(
+        assert_modify_denied(
             &events,
             std::slice::from_ref(&order),
             &OrderDeniedReason::NotionalExceedsFreeBalance {
@@ -9841,7 +9862,7 @@ fn test_modify_market_order_missing_price_keeps_asset_checks(
         }
     };
 
-    assert_modify_rejected(
+    assert_modify_denied(
         &get_process_order_event_handler_messages(&process_order_event_handler),
         &[order],
         &reason.to_string(),
@@ -9921,7 +9942,7 @@ fn test_modify_order_rejects_original_exposure_calculation_failure(
         None,
     )));
 
-    assert_modify_rejected(
+    assert_modify_denied(
         &get_process_order_event_handler_messages(&process_order_event_handler),
         std::slice::from_ref(&order),
         &reason.to_string(),
@@ -9976,7 +9997,7 @@ fn test_modify_order_rejects_betting_account_instrument_mismatch(
         None,
     )));
 
-    assert_modify_rejected(
+    assert_modify_denied(
         &get_process_order_event_handler_messages(&process_order_event_handler),
         &[order],
         &OrderDeniedReason::BettingBalanceLockedCalculationFailed {
@@ -10077,7 +10098,7 @@ fn test_modify_inverse_order_collateral_checks(
             .try_calculate_notional_value(quantity, price, None)
             .unwrap_err()
             .to_string();
-        assert_modify_rejected(
+        assert_modify_denied(
             &events,
             std::slice::from_ref(&order),
             &OrderDeniedReason::NotionalCalculationFailed { detail }.to_string(),
@@ -10087,7 +10108,7 @@ fn test_modify_inverse_order_collateral_checks(
         assert!(events.is_empty());
         assert_eq!(commands, vec![command]);
     } else {
-        assert_modify_rejected(
+        assert_modify_denied(
             &events,
             std::slice::from_ref(&order),
             &OrderDeniedReason::InitialMarginExceedsFreeBalance {
@@ -10162,7 +10183,7 @@ fn test_modify_cash_sell_cannot_credit_closing_exposure(
         None,
     )));
 
-    assert_modify_rejected(
+    assert_modify_denied(
         &get_process_order_event_handler_messages(&process_order_event_handler),
         &[order],
         &OrderDeniedReason::CumulativeNotionalExceedsFreeBalance {
@@ -10282,7 +10303,7 @@ fn test_modify_trailing_order_rejects_missing_original_price(
         Some(Price::from("100.00")),
     )));
 
-    assert_modify_rejected(
+    assert_modify_denied(
         &get_process_order_event_handler_messages(&process_order_event_handler),
         std::slice::from_ref(&order),
         &OrderDeniedReason::MarketPriceUnavailable {
@@ -10387,7 +10408,7 @@ fn test_batch_modify_orders_error_paths(
             assert!(commands.is_empty());
         }
         "rate_limit" => {
-            assert_modify_rejected(&events, &orders, "Exceeded MAX_ORDER_MODIFY_RATE");
+            assert_modify_denied(&events, &orders, "Exceeded MAX_ORDER_MODIFY_RATE");
             assert!(commands.is_empty());
 
             let single = TradingCommand::ModifyOrder(modify_command(
@@ -10409,7 +10430,7 @@ fn test_batch_modify_orders_error_paths(
         }
         "mismatch" => {
             assert_eq!(events.len(), 2);
-            assert_modify_rejected(
+            assert_modify_denied(
                 &events[..1],
                 &orders[1..],
                 &format!(
@@ -10417,7 +10438,7 @@ fn test_batch_modify_orders_error_paths(
                     instrument_eth_usdt.id()
                 ),
             );
-            assert_modify_rejected(
+            assert_modify_denied(
                 &events[1..],
                 &orders[..1],
                 "BatchModifyOrders rejected because one or more child modifications failed validation",
@@ -10425,7 +10446,7 @@ fn test_batch_modify_orders_error_paths(
             assert!(commands.is_empty());
         }
         "missing" => {
-            assert_modify_rejected(
+            assert_modify_denied(
                 &events,
                 &orders[..1],
                 "BatchModifyOrders rejected because one or more child modifications failed validation",
@@ -10494,7 +10515,7 @@ fn test_modify_price_rechecks_cached_quantity_bounds(
         None,
     )));
 
-    assert_modify_rejected(
+    assert_modify_denied(
         &get_process_order_event_handler_messages(&process_order_event_handler),
         std::slice::from_ref(&order),
         &reason.to_string(),
@@ -10608,7 +10629,7 @@ fn test_batch_modify_rejection_tolerates_cache_reset_in_callback(
         _ => unreachable!(),
     };
 
-    assert_modify_rejected(&events.borrow(), std::slice::from_ref(rejected), &reason);
+    assert_modify_denied(&events.borrow(), std::slice::from_ref(rejected), &reason);
     assert!(get_execute_order_event_handler_messages(&execute_order_event_handler).is_empty());
 
     for order in &orders {
@@ -10683,7 +10704,7 @@ fn test_modify_quote_quantity_sell_uses_greater_limit_or_bid(
     let commands = get_execute_order_event_handler_messages(&execute_order_event_handler);
 
     if exceed_limit {
-        assert_modify_rejected(
+        assert_modify_denied(
             &events,
             std::slice::from_ref(&order),
             &OrderDeniedReason::NotionalExceedsMaxPerOrder {
@@ -10799,12 +10820,12 @@ fn assert_cached_order_unchanged(risk: &RiskEngine, original: &OrderAny) {
     assert_eq!(cached.event_count(), original.event_count());
 }
 
-fn assert_modify_rejected(events: &[OrderEventAny], orders: &[OrderAny], reason: &str) {
+fn assert_modify_denied(events: &[OrderEventAny], orders: &[OrderAny], reason: &str) {
     assert_eq!(events.len(), orders.len());
 
     for (event, order) in events.iter().zip(orders) {
-        let OrderEventAny::ModifyRejected(event) = event else {
-            panic!("Expected OrderModifyRejected, received {event:?}")
+        let OrderEventAny::ModifyDenied(event) = event else {
+            panic!("Expected OrderModifyDenied, received {event:?}")
         };
 
         assert_eq!(event.trader_id, order.trader_id());
@@ -10816,8 +10837,6 @@ fn assert_modify_rejected(events: &[OrderEventAny], orders: &[OrderAny], reason:
         assert_eq!(event.reason, Ustr::from(reason));
         assert_eq!(event.ts_event, UnixNanos::default());
         assert_eq!(event.ts_init, UnixNanos::default());
-        assert!(!event.reconciliation);
-        assert_eq!(event.causation_id, None);
     }
 }
 
@@ -11010,7 +11029,7 @@ fn test_batch_modify_orders_counts_each_child_against_rate_limit(
         saved_execute_messages.first(),
         Some(TradingCommand::ModifyOrders(command)) if command.modifies.len() == 2
     ));
-    assert_modify_rejected(&events, &[order1], "Exceeded MAX_ORDER_MODIFY_RATE");
+    assert_modify_denied(&events, &[order1], "Exceeded MAX_ORDER_MODIFY_RATE");
 }
 
 #[rstest]
@@ -11113,7 +11132,7 @@ fn test_batch_modify_orders_rejects_all_children_when_one_child_fails_validation
     assert!(
         saved_process_messages
             .iter()
-            .all(|event| { event.event_type() == OrderEventType::ModifyRejected })
+            .all(|event| { event.event_type() == OrderEventType::ModifyDenied })
     );
     assert!(saved_process_messages.iter().any(|event| {
         event.client_order_id() == order1.client_order_id()
@@ -12878,6 +12897,163 @@ fn test_submit_order_margin_account_within_free_balance(
 }
 
 #[rstest]
+#[case::within_available("1000.0", None)]
+#[case::at_available("5000.0", None)]
+#[case::above_available("6000.0", Some("300 USDG"))]
+fn test_submit_order_after_reported_margin_initialization(
+    #[case] price: &str,
+    #[case] denied_margin: Option<&str>,
+    strategy_id_ema_cross: StrategyId,
+    trader_id: TraderId,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    execute_order_event_handler: TypedIntoMessageSavingHandler<TradingCommand>,
+) {
+    let currency = Currency::USDG();
+    let account_id = AccountId::new("LIGHTER_ROBINHOOD-001");
+    let mut perp = btcusd_bybit();
+    perp.id = InstrumentId::from("BTC-PERP.LIGHTER_ROBINHOOD");
+    perp.quote_currency = currency;
+    perp.settlement_currency = currency;
+    perp.is_inverse = false;
+    perp.margin_init = dec!(0.05);
+    perp.margin_maint = dec!(0.03);
+    let instrument = InstrumentAny::CryptoPerpetual(perp);
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+
+    let quote = QuoteTick::new(
+        instrument.id(),
+        Price::from("10000.0"),
+        Price::from("10001.0"),
+        Quantity::from("2"),
+        Quantity::from("3"),
+        0.into(),
+        0.into(),
+    );
+
+    cache.borrow_mut().add_quote(quote).unwrap();
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+
+    let mut portfolio = Portfolio::new(
+        Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+        Rc::clone(&cache),
+        None,
+    );
+
+    let state = AccountState::new(
+        account_id,
+        AccountType::Margin,
+        vec![AccountBalance::new(
+            Money::from("1000 USDG"),
+            Money::from("750 USDG"),
+            Money::from("250 USDG"),
+        )],
+        vec![MarginBalance::new(
+            Money::from("750 USDG"),
+            Money::from("0 USDG"),
+            None,
+        )],
+        true,
+        UUID4::new(),
+        0.into(),
+        0.into(),
+        None,
+    );
+
+    portfolio.update_account(&state);
+    let fill = OrderFilledSpec::builder()
+        .instrument_id(instrument.id())
+        .account_id(account_id)
+        .order_side(OrderSide::Buy)
+        .last_qty(Quantity::from("1"))
+        .last_px(Price::from("10000.0"))
+        .currency(currency)
+        .position_id(PositionId::new("P-5578"))
+        .build();
+    let position = Position::new(&instrument, fill);
+    cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+    portfolio.initialize_orders();
+    portfolio.initialize_positions();
+
+    let mut risk_engine = RiskEngine::new(
+        RiskEngineConfig::default(),
+        portfolio,
+        clock,
+        Rc::clone(&cache),
+    );
+
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1"))
+        .price(Price::from(price))
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    let submit = SubmitOrder::new(
+        trader_id,
+        None,
+        strategy_id_ema_cross,
+        instrument.id(),
+        order.client_order_id(),
+        order.init_event().clone(),
+        None,
+        None,
+        None,
+        UUID4::new(),
+        0.into(),
+        None,
+    );
+
+    risk_engine.execute(TradingCommand::SubmitOrder(submit));
+    let process = get_process_order_event_handler_messages(&process_order_event_handler);
+    let execute = get_execute_order_event_handler_messages(&execute_order_event_handler);
+    assert_eq!(
+        cache
+            .borrow()
+            .account(&account_id)
+            .unwrap()
+            .balance_free(Some(currency)),
+        Some(Money::from("250 USDG"))
+    );
+
+    if let Some(margin) = denied_margin {
+        assert_eq!(process.len(), 1);
+        assert_eq!(process[0].event_type(), OrderEventType::Denied);
+        assert_eq!(
+            process[0].message().unwrap(),
+            Ustr::from(
+                &OrderDeniedReason::InitialMarginExceedsFreeBalance {
+                    free_balance: Money::from("250 USDG"),
+                    initial_margin: Money::from(margin),
+                }
+                .to_string()
+            )
+        );
+        assert_eq!(execute.len(), 0);
+    } else {
+        assert_eq!(process.len(), 0);
+        assert_eq!(execute.len(), 1);
+        assert_eq!(execute[0].instrument_id(), instrument.id());
+
+        let TradingCommand::SubmitOrder(submit) = &execute[0] else {
+            panic!("expected order submission");
+        };
+
+        assert_eq!(submit.client_order_id, order.client_order_id());
+    }
+}
+
+#[rstest]
 #[case::within_balance("100 USDT", None)]
 #[case::exceeds_balance("0.4 USDT", Some(("0.4 USDT", "0.5 USDT")))]
 fn test_submit_order_margin_account_quanto_checks_settlement_balance(
@@ -14443,7 +14619,7 @@ fn test_modify_order_when_trading_restricted_then_rejects(
     assert_eq!(saved_process_messages.len(), 1);
     assert_eq!(
         saved_process_messages[0].event_type(),
-        OrderEventType::ModifyRejected
+        OrderEventType::ModifyDenied
     );
     assert_eq!(
         saved_process_messages[0].message().unwrap(),
@@ -14526,7 +14702,7 @@ fn test_modify_order_with_invalid_price_precision_then_rejects(
     assert_eq!(saved_process_messages.len(), 1);
     assert_eq!(
         saved_process_messages[0].event_type(),
-        OrderEventType::ModifyRejected
+        OrderEventType::ModifyDenied
     );
     assert_eq!(
         saved_process_messages[0].message().unwrap(),
@@ -14607,7 +14783,7 @@ fn test_modify_order_with_invalid_quantity_precision_then_rejects(
     assert_eq!(saved_process_messages.len(), 1);
     assert_eq!(
         saved_process_messages[0].event_type(),
-        OrderEventType::ModifyRejected
+        OrderEventType::ModifyDenied
     );
     assert_eq!(
         saved_process_messages[0].message().unwrap(),
@@ -15280,7 +15456,7 @@ fn test_modify_order_ignores_positions_of_other_accounts(
     let commands = get_execute_order_event_handler_messages(&execute_order_event_handler);
 
     if let Some(reason) = denial {
-        assert_modify_rejected(&events, &[order], reason);
+        assert_modify_denied(&events, &[order], reason);
         assert!(commands.is_empty());
     } else {
         assert!(events.is_empty());

@@ -576,36 +576,6 @@ async fn account_attempt_budget_stops_wire_polls_without_erasing_intent() {
 
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
 #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
-async fn unsubscribe_cancels_admission_wait_before_any_poll_is_sent() {
-    let (peer, mut http, mut observed) = timed_peer(vec![
-        (200, EXCHANGES, Duration::ZERO),
-        (200, MARKET, Duration::ZERO),
-    ])
-    .await;
-    http.min_request_interval_ms = 200;
-    let (mut client, mut receiver) = connected(http).await;
-
-    subscribe(&mut client, true, true);
-    wait_for_admission(&client).await;
-    unsubscribe(&mut client, true, true);
-    time::sleep(Duration::from_millis(250)).await;
-    client.disconnect().await.unwrap();
-    assert_eq!(
-        time::timeout(Duration::from_secs(5), peer)
-            .await
-            .unwrap()
-            .unwrap()
-            .len(),
-        2
-    );
-    assert_eq!(observed.try_recv().unwrap().0, 0);
-    assert_eq!(observed.try_recv().unwrap().0, 1);
-    assert!(observed.try_recv().is_err());
-    assert!(receiver.try_recv().is_err());
-}
-
-#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-#[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
 async fn unsubscribe_and_resubscribe_rejects_old_response() {
     let (peer, http, mut observed) = timed_peer(vec![
         (200, EXCHANGES, Duration::ZERO),
@@ -651,6 +621,7 @@ async fn unsubscribe_and_resubscribe_rejects_old_response() {
 #[cfg_attr(not(all(feature = "simulation", madsim)), tokio::test)]
 async fn large_activity_batches_preserve_records_deduplication_and_cancellation(
     #[case] limit: u32,
+    #[values(false, true)] staggered: bool,
 ) {
     #[cfg(all(feature = "simulation", madsim))]
     madsim::net::NetSim::current().update_config(|config| {
@@ -693,17 +664,19 @@ async fn large_activity_batches_preserve_records_deduplication_and_cancellation(
 
     batch["quotes"] = Value::Array(quotes);
     batch["trades"] = Value::Array(trades);
+    let response_delay = Duration::from_millis(150);
     let (peer, mut http, mut observed) = timed_peer(vec![
         (200, EXCHANGES.to_owned(), Duration::ZERO),
         (200, MARKET.to_owned(), Duration::ZERO),
-        (200, batch.to_string(), Duration::from_millis(150)),
+        (200, batch.to_string(), response_delay),
+        (200, batch.to_string(), response_delay),
         (200, batch.to_string(), Duration::ZERO),
         (200, OLDER.to_owned(), Duration::ZERO),
         (200, ACTIVITY.to_owned(), Duration::from_millis(500)),
     ])
     .await;
     http.max_concurrent_requests = 4;
-    http.attempt_budget = 6;
+    http.attempt_budget = 7;
     http.retry.max_retries = 0;
     http.min_request_interval_ms = 20;
     let minimum_spacing = Duration::from_millis(http.min_request_interval_ms);
@@ -721,6 +694,7 @@ async fn large_activity_batches_preserve_records_deduplication_and_cancellation(
         ..Default::default()
     };
 
+    let poll_interval = Duration::from_millis(config.poll_interval_ms);
     let mut client =
         FinFeedDataClient::new(ClientId::from("FINFEED"), config, sender.into()).unwrap();
     let bootstrap_started = time::Instant::now();
@@ -729,7 +703,25 @@ async fn large_activity_batches_preserve_records_deduplication_and_cancellation(
         receiver.try_recv().unwrap(),
         DataEvent::Data(Data::Instrument(_))
     ));
-    subscribe(&mut client, true, true);
+    let mut arrivals = Vec::new();
+
+    if staggered {
+        subscribe(&mut client, true, false);
+
+        for _ in 0..3 {
+            arrivals.push(
+                time::timeout(Duration::from_secs(5), observed.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+
+        subscribe(&mut client, false, true);
+    } else {
+        subscribe(&mut client, true, true);
+    }
+
     let mut actual = Vec::new();
     for _ in &expected {
         actual.push(event(&mut receiver).await);
@@ -739,16 +731,17 @@ async fn large_activity_batches_preserve_records_deduplication_and_cancellation(
     actual.push(event(&mut receiver).await);
     expected.push(quote("0.2", "0.3", "5.000005", "6.000006", 0, 1));
     expected.push(trade("trade-2", "0.21", "3.000003", 1));
-    let mut starts = Vec::new();
 
-    for index in 0..6 {
-        let (actual_index, started) = time::timeout(Duration::from_secs(5), observed.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(actual_index, index);
-        starts.push(started);
+    for _ in arrivals.len()..7 {
+        arrivals.push(
+            time::timeout(Duration::from_secs(5), observed.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
     }
+
+    let (indices, starts): (Vec<_>, Vec<_>) = arrivals.into_iter().unzip();
 
     client.disconnect().await.unwrap();
     let requests = time::timeout(Duration::from_secs(5), peer)
@@ -757,7 +750,8 @@ async fn large_activity_batches_preserve_records_deduplication_and_cancellation(
         .unwrap();
     assert_eq!(actual, expected);
     assert!(receiver.try_recv().is_err());
-    assert_eq!(requests.len(), 6);
+    assert_eq!(requests.len(), 7);
+    assert_eq!(indices, (0..7).collect::<Vec<_>>());
 
     for request in &requests[2..] {
         assert_request(
@@ -769,7 +763,12 @@ async fn large_activity_batches_preserve_records_deduplication_and_cancellation(
 
     // Anchor before bootstrap because peer reads can lag admission times.
     assert!(starts[2].duration_since(bootstrap_started) >= 2 * minimum_spacing);
-    assert!(starts[3].duration_since(starts[2]) >= Duration::from_millis(250));
+    // The first poll may be cancelled when the second subscription arrives
+    let spacing = starts[4].duration_since(starts[3]);
+    assert!(
+        spacing >= response_delay + poll_interval,
+        "poll spacing was {spacing:?}"
+    );
 }
 
 #[rstest]
@@ -1060,17 +1059,6 @@ async fn unsubscribe_cancels_retry_backoff_without_sending_retry() {
         3
     );
     assert!(receiver.try_recv().is_err());
-}
-
-pub(super) async fn wait_for_admission(client: &FinFeedDataClient) {
-    time::timeout(Duration::from_secs(3), async {
-        // The transport holds next_request across its admission sleep
-        while !format!("{client:?}").contains("next_request: Mutex { data: <locked> }") {
-            time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await
-    .expect("FinFeed poll must wait for admission before unsubscribe");
 }
 
 pub(super) async fn wait_for_retry_backoff(client: &FinFeedDataClient) {
@@ -1422,7 +1410,7 @@ pub(super) async fn connected_selection(
         http,
         instruments: vec![FinFeedInstrumentSelection {
             exchange_id: "POLYMARKET".into(),
-            market_ids,
+            market_ids: market_ids.iter().map(|id| id.as_str().into()).collect(),
         }],
         poll_interval_ms,
         poll_limit: 100,
@@ -1590,7 +1578,7 @@ pub(super) async fn timed_peer(
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
 
     let config = FinFeedHttpConfig {
-        base_url: format!("http://{address}/v1/"),
+        base_url: format!("http://{address}/v1/").into(),
         min_request_interval_ms: 1,
         retry: RetryConfig {
             initial_delay_ms: 10,

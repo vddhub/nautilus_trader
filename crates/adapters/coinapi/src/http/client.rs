@@ -46,7 +46,9 @@ use super::{
         SymbolsQuery, TradesQuery, provider_time,
     },
 };
-use crate::common::{consts::COINAPI_NAUTILUS_REFERRER, credential::is_valid_api_key};
+use crate::common::{
+    consts::COINAPI_NAUTILUS_REFERRER, credential::is_valid_api_key, enums::OhlcvPeriod,
+};
 
 /// Primary CoinAPI Market Data REST endpoint, including its version prefix.
 pub const REST_URL: &str = "https://rest.coinapi.io/v1/";
@@ -110,17 +112,17 @@ pub struct HistoryPages<T> {
 /// Requests return raw protocol models. The single-page historical methods fetch exactly one
 /// page; callers must not infer completeness from a full page. The range methods page through a
 /// whole window.
+/// Range requests run serially so each sizes its pages after earlier ranges settle their credits.
 #[derive(Debug)]
 pub struct CoinApiHttpClient {
-    client: HttpClient,
-    base_url: Url,
     api_key: SecretString,
+    base_url: Url,
+    client: HttpClient,
     concurrency: tokio::sync::Semaphore,
-    // Serializes range requests so each sizes its pages after earlier ranges settle their credits
     ranges: tokio::sync::Mutex<()>,
-    credits_remaining: AtomicU64,
     retry: RetryManager<Error>,
     cancellation: CancellationToken,
+    credits_remaining: AtomicU64,
 }
 
 impl CoinApiHttpClient {
@@ -195,14 +197,14 @@ impl CoinApiHttpClient {
             ])
             .build()?;
         Ok(Self {
-            client,
-            base_url,
             api_key,
+            base_url,
+            client,
             concurrency: tokio::sync::Semaphore::new(config.max_concurrent_requests),
             ranges: tokio::sync::Mutex::new(()),
-            credits_remaining: AtomicU64::new(config.credit_budget),
             retry: RetryManager::new(config.retry),
             cancellation: CancellationToken::new(),
+            credits_remaining: AtomicU64::new(config.credit_budget),
         })
     }
 
@@ -365,6 +367,7 @@ impl CoinApiHttpClient {
     ) -> Result<HistoryPages<Quote>, Error> {
         self.get_range(
             range,
+            1,
             |quote: &Quote| quote.time_exchange,
             |page| async move { self.get_quotes(symbol_id, &page).await },
         )
@@ -401,6 +404,7 @@ impl CoinApiHttpClient {
     ) -> Result<HistoryPages<Trade>, Error> {
         self.get_range(
             range,
+            1,
             |trade: &Trade| trade.time_exchange,
             |page| async move {
                 let query = TradesQuery {
@@ -426,7 +430,7 @@ impl CoinApiHttpClient {
         query: &OhlcvQuery,
     ) -> Result<Vec<Ohlcv>, Error> {
         query.range.validate()?;
-        if query.period_id.trim().is_empty() {
+        if query.period_id.as_ref().trim().is_empty() {
             return Err(Error::Validation("period_id must not be empty".into()));
         }
 
@@ -445,15 +449,16 @@ impl CoinApiHttpClient {
     pub async fn get_ohlcv_range(
         &self,
         symbol_id: &str,
-        period_id: &str,
+        period_id: OhlcvPeriod,
         range: &HistoryRange,
     ) -> Result<HistoryPages<Ohlcv>, Error> {
         self.get_range(
             range,
+            2,
             |ohlcv: &Ohlcv| ohlcv.time_period_start,
             |page| async move {
                 let query = OhlcvQuery {
-                    period_id: period_id.to_owned(),
+                    period_id,
                     range: page,
                 };
 
@@ -463,12 +468,11 @@ impl CoinApiHttpClient {
         .await
     }
 
-    // A full page can end partway through the records that share its last timestamp, so that
-    // group is dropped and the next page starts at its timestamp. CoinAPI returns the window
-    // [time_start, time_end), including every record at time_start.
+    // Refetch the trailing timestamp group of a full page to avoid splitting equal-time records
     async fn get_range<T, F, Fut>(
         &self,
         range: &HistoryRange,
+        min_page_limit: usize,
         key: fn(&T) -> Timestamp,
         mut fetch: F,
     ) -> Result<HistoryPages<T>, Error>
@@ -495,6 +499,7 @@ impl CoinApiHttpClient {
                 usize::try_from(self.credits_remaining().saturating_mul(100)).unwrap_or(usize::MAX);
             let page_limit = remaining
                 .unwrap_or(usize::MAX)
+                .max(min_page_limit)
                 .min(HISTORY_LIMIT_MAX as usize)
                 .min(affordable);
 
@@ -530,12 +535,18 @@ impl CoinApiHttpClient {
             }
 
             let is_full = page.len() >= page_limit;
+            let reaches_end = page
+                .last()
+                .is_some_and(|record| key(record) >= range.time_end);
 
             // CoinAPI can substitute nearby OHLCV periods for an empty window
             page.retain(|record| (cursor..range.time_end).contains(&key(record)));
+            if let Some(remaining) = remaining {
+                page.truncate(remaining);
+            }
 
             // A full page emptied by filtering held only fallback periods outside the window
-            if !is_full || page.is_empty() || remaining == Some(page_limit) {
+            if !is_full || reaches_end || page.is_empty() || remaining == Some(page.len()) {
                 records.extend(page);
                 return Ok(HistoryPages {
                     records,
@@ -547,6 +558,12 @@ impl CoinApiHttpClient {
             let boundary = page.partition_point(|record| key(record) < last);
 
             if boundary == 0 {
+                // Filtering a leading period can leave one timestamp ahead of the cursor
+                if page.len() < page_limit && last > cursor {
+                    cursor = last;
+                    continue;
+                }
+
                 return Err(Error::Response(format!(
                     "{page_limit} records share timestamp {last}, so paging cannot advance"
                 )));

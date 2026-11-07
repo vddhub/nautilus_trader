@@ -282,7 +282,7 @@ async fn multi_outcome_bootstrap_sizes_allowance_and_whole_deadline(
         http,
         instruments: vec![FinFeedInstrumentSelection {
             exchange_id: "POLYMARKET".into(),
-            market_ids: ids.clone(),
+            market_ids: ids.iter().map(|id| id.as_str().into()).collect(),
         }],
         connect_timeout_secs: deadline,
         ..Default::default()
@@ -367,7 +367,7 @@ async fn polling_workload_shares_feeds_and_bounds_fanout(#[case] markets: usize)
     });
 
     let http = FinFeedHttpConfig {
-        base_url: format!("http://{address}/v1/"),
+        base_url: format!("http://{address}/v1/").into(),
         min_request_interval_ms: 1,
         attempt_budget: attempts as u64,
         ..Default::default()

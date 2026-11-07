@@ -3269,6 +3269,46 @@ pub(crate) mod serial_tests {
 
     #[rstest]
     #[tokio::test]
+    async fn test_startup_mass_status_registers_recovered_instrument_without_engine_borrow() {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecutionEngineConfig {
+                reconciliation: true,
+                ..Default::default()
+            },
+            delay_post_stop: Duration::ZERO,
+            ..Default::default()
+        };
+
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "RecoveredInstrumentStartup",
+            config,
+            StartupMassStatusBehavior::Unavailable,
+        );
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let instrument_id = instrument.id();
+        assert!(
+            node.kernel()
+                .cache()
+                .borrow()
+                .instrument(&instrument_id)
+                .is_none()
+        );
+        *state.recovered_instrument.lock() = Some(instrument.clone());
+
+        node.start().await.unwrap();
+
+        assert_eq!(
+            node.kernel().cache().borrow().instrument(&instrument_id),
+            Some(&instrument)
+        );
+        assert_eq!(state.instrument_updates.load(Ordering::Relaxed), 1);
+        assert!(state.mass_status_requested.load(Ordering::Relaxed));
+        node.stop().await.unwrap();
+        node.dispose();
+    }
+
+    #[rstest]
+    #[tokio::test]
     async fn test_startup_mass_status_registers_external_order_with_source_client() {
         let config = LiveNodeConfig {
             exec_engine: LiveExecutionEngineConfig {
@@ -4604,7 +4644,7 @@ pub(crate) mod serial_tests {
         assert!(state.targeted_order_report_ids.lock().is_empty());
 
         node.exec_manager_mut()
-            .register_inflight(missing_client_order_id);
+            .register_inflight(missing_client_order_id, UUID4::new());
         tokio::time::advance(Duration::from_millis(1)).await;
         let inflight = node.exec_manager_mut().check_inflight_orders();
         assert!(
@@ -4681,7 +4721,8 @@ pub(crate) mod serial_tests {
             &[client_order_id]
         );
 
-        node.exec_manager_mut().register_inflight(client_order_id);
+        node.exec_manager_mut()
+            .register_inflight(client_order_id, UUID4::new());
         tokio::time::advance(Duration::from_millis(1)).await;
         let inflight = node.exec_manager_mut().check_inflight_orders();
         assert!(
@@ -5320,7 +5361,8 @@ pub(crate) mod serial_tests {
             VenueOrderId::from("V-TARGETED-C"),
             client_id,
         );
-        node.exec_manager_mut().register_inflight(order_a);
+        node.exec_manager_mut()
+            .register_inflight(order_a, UUID4::new());
         assert_eq!(
             node.kernel()
                 .cache

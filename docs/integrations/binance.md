@@ -318,13 +318,17 @@ matching engine. Thus, they do not blindly retry after a timeout, network failur
 response. Retrying could create a duplicate order or apply a second amendment.
 
 - Local submit validation emits `OrderDenied` before submission. Local modify validation emits
-  `OrderModifyRejected`. A definitive venue rejection emits the matching rejection event.
+  `OrderModifyDenied`. A definitive venue rejection emits the matching rejection event.
 - An ambiguous transport result remains inflight and is resolved by the private stream or REST
   reconciliation. The adapter does not emit a false rejection while the venue outcome is unknown.
 - A Futures algo cancel may fall back from the pre-trigger algo endpoint to the regular-order endpoint. This
   changes endpoint after the order triggers. It does not resend the same cancel to the same endpoint.
 - Strategy code must not resubmit a command while its result is ambiguous. Wait for reconciliation
   or query the order by its client order ID.
+
+The Futures execution client checks its cancellation attempts and owned orders still pending cancellation
+at disconnect. It returns an error if any affected order lacks terminal confirmation.
+These orders may remain open at Binance. Query each by its client order ID before retrying cancellation.
 
 `BinanceDataClientConfig` and `BinanceExecutionClientConfig` expose `max_retries`,
 `retry_delay_initial_ms`, and `retry_delay_max_ms` for HTTP GET requests. Transient read failures
@@ -353,6 +357,19 @@ positions are removed, unresolved instruments and other conversion failures also
 position fails, `generate_position_status_reports` returns an error with the failure count instead
 of an incomplete report set. See
 [instrument availability](../concepts/execution/reconciliation.md#instrument-availability).
+
+#### Futures margin calculations
+
+USD-M and COIN-M Futures instruments use an initial margin factor of `1`. With the default
+`LeveragedMarginModel`, local initial margin equals notional divided by the cached account leverage.
+
+Margin accounts start at 1x leverage and require the full notional until their cached leverage changes.
+Setting `futures_leverages` requests venue leverage but does not update the cached account leverage.
+
+Local maintenance margin equals notional divided by cached account leverage, multiplied by the
+`margin_maint` factor of `0.1`. This calculation does not model Binance's bracket-specific maintenance ratios
+for [USD-M](https://developers.binance.com/docs/derivatives/usds-margined-futures/account/rest-api/Notional-and-Leverage-Brackets)
+or [COIN-M](https://developers.binance.com/docs/derivatives/coin-margined-futures/account/rest-api/Notional-Bracket-for-Pair).
 
 ### Risk events
 
@@ -420,7 +437,36 @@ formula does not account for contract size. Configure `default_taker_fee` on
 | Order status updates | ✓    | ✓            | ✓            | Real-time order state changes. |
 | Trade history        | ✓    | ✓            | ✓            | Execution and fill reports.    |
 
-#### Futures trade-history retention
+#### Startup recovery
+
+Mass status combines open orders with available closed-order history for orders created within the
+reconciliation lookback window. Orders created before that window can be missed even if they fill within it.
+Historical USD-M conditional orders retain their original client order IDs and order types when their parent
+orders appear in the queried history.
+
+For instruments without open orders or saved state, select them through `load_ids` with `load_all=False`,
+the provider's `symbols` filter, or `external_order_instrument_ids`. Broad `bases`, `quotes`, and
+`contract_types` filters do not initiate catalog-wide history scans.
+
+History requests run sequentially per instrument. Long lookbacks, many instruments, or heavy order activity
+can exceed the node's default 30-second `timeout_reconciliation`. Use a bounded `reconciliation_lookback_mins`
+and increase that timeout when needed. With no lookback, Spot scans all available order history; Futures
+applies the 88-day window described below.
+
+An order-history failure drops that instrument's historical orders and marks the snapshot incomplete.
+Open orders, positions, fills, and other instruments' historical orders remain available. A failed
+fill-history request fails mass status.
+
+Spot startup history updates order facts only, including when `reconciliation_lookback_mins` is unset.
+Position recovery requires saved owned orders and positions in the configured cache backing store.
+Wallet balances do not establish ownership of individual positions. Startup history does not create missing
+Spot positions or advance stale saved positions.
+
+#### Futures history retention
+
+Binance omits canceled or expired Futures orders with no fills once their creation time is more than three
+days old. It also omits orders created more than 90 days ago. Recovery depends on the history Binance retains;
+`reports_complete` does not detect orders removed by these venue limits.
 
 Binance retains USD-M and COIN-M account trades for the past three months. Binance does not define whether
 this means calendar months or a fixed duration. Thus, the adapter uses the most recent 88 days as its complete
@@ -720,6 +766,14 @@ with these flags:
 - Every snapshot delta carries `F_SNAPSHOT`, and the final delta carries `F_SNAPSHOT | F_LAST`.
 - A snapshot without levels is a lone `Clear` that empties the book.
 
+Native `OrderBookDepth` subscriptions require `L2_MBP` and support up to 20 levels per side, with
+10 levels by default. They use the 20-level partial-book stream and limit each published snapshot
+to the requested depth. Native depth and delta subscriptions share that stream when both request
+20-level source data; unsubscribing either consumer leaves the other active. A conflicting delta
+depth or update speed requires unsubscribing before changing the stream.
+Native depth also publishes companion snapshot deltas. It cannot share an instrument with an
+`L1_MBP` delta subscription.
+
 ### Futures L2 subscriptions
 
 The `L2_MBP` subscription depth selects the stream:
@@ -826,10 +880,11 @@ resyncs, such as after a reconnect, waits for budget instead of exceeding it:
 
 | Product | Snapshot budget  | Burst (half the budget) | Full snapshot cost |
 | ------- | ---------------- | ----------------------- | ------------------ |
-| Spot    | 3,000 per minute | 1,500                   | 250 (5000 levels)  |
+| Spot    | 1,200 per minute | 600                     | 250 (5000 levels)  |
 | Futures | 1,200 per minute | 600                     | 20 (1000 levels)   |
 
-- Queueing for the first snapshot does not consume the recovery's attempts or 180-second budget.
+- Waiting for the first snapshot-pacer reservation does not consume recovery attempts or the 180-second budget.
+  After that reservation, REST quota and cooldown waits count against the snapshot timeout.
 - Explicit snapshot requests draw on the same budget.
 - Each HTTP attempt, including retries, spends snapshot weight immediately before transmission.
   Queued reservations do not accumulate send credit during a cooldown. An unsent attempt releases its
@@ -1226,22 +1281,24 @@ Binance's own per-IP weight allowance, which the endpoint costs below draw from:
 
 Binance charges these weights per request:
 
-| Endpoint                  | Weight | Notes                                  |
-| ------------------------- | ------ | -------------------------------------- |
-| `/api/v3/order`           | 1      | Spot order placement.                  |
-| `/api/v3/allOrders`       | 20     | Spot historical orders (expensive).    |
-| `/api/v3/klines`          | 2+     | Scales with `limit` parameter.         |
-| `/api/v3/depth`           | 5+     | Scales with `limit`; 250 at 5000.      |
-| `/fapi/v1/order`          | 1      | Futures order placement.               |
-| `/fapi/v1/algoOrder`      | 0      | Uses order-count limits.               |
-| `/fapi/v1/allOrders`      | 20     | Futures historical orders (expensive). |
-| `/fapi/v1/commissionRate` | 20     | Futures commission rate query.         |
-| `/fapi/v1/klines`         | 5+     | Scales with `limit` parameter.         |
-| `/fapi/v1/depth`          | 2+     | Scales with `limit`; 20 at 1000.       |
+| Endpoint                  | Weight         | Notes                                 |
+| ------------------------- | -------------- | ------------------------------------- |
+| `/api/v3/order`           | 1              | Spot order placement.                 |
+| `/api/v3/allOrders`       | 20             | Spot historical orders (expensive).   |
+| `/api/v3/klines`          | 2              | Fixed cost for supported limits.      |
+| `/api/v3/depth`           | 5, 25, 50, 250 | Scales with `limit`; 250 at 5000.     |
+| `/fapi/v1/order`          | 0              | Futures order placement.              |
+| `/fapi/v1/algoOrder`      | 0              | Uses order-count limits.              |
+| `/fapi/v1/allOrders`      | 5              | Futures historical orders.            |
+| `/fapi/v1/commissionRate` | 20             | Futures commission rate query.        |
+| `/fapi/v1/klines`         | 1, 2, 5, 10    | Scales with `limit`; default costs 5. |
+| `/fapi/v1/depth`          | 2, 5, 10, 20   | Scales with `limit`; 20 at 1000.      |
 
-USD-M Futures `POST /fapi/v1/algoOrder` consumes `1` from both `X-MBX-ORDER-COUNT-10S` and
-`X-MBX-ORDER-COUNT-1M`. Binance charges no IP request weight for this endpoint. The adapter still requires
-a global-bucket token and fails locally if it is unavailable.
+USD-M Futures `POST /fapi/v1/order`, `POST /fapi/v1/algoOrder`, and `PUT /fapi/v1/order`
+consume 1 from both `X-MBX-ORDER-COUNT-10S` and `X-MBX-ORDER-COUNT-1M`, without IP request weight.
+COIN-M `POST /dapi/v1/order` and `POST /dapi/v1/algoOrder` also consume no IP request weight.
+These requests can proceed when the local request-weight bucket is empty, subject to order-count
+quota and shared REST cooldowns.
 
 ### WebSocket API limits
 
@@ -1256,14 +1313,15 @@ REST API:
 
 ### Adapter pacing
 
-The adapter runs its own token bucket limiters ahead of the venue's accounting. Every HTTP request
-draws one token from a per-product request bucket. Placements and applicable modifications also draw
-from the order-count buckets:
+The adapter runs token bucket limiters ahead of the venue's fixed-window accounting. Each supported
+HTTP endpoint consumes its published request weight before transmission. Retries and history pages
+acquire their full weight for every attempt. Placements and applicable modifications draw from
+the order-count buckets:
 
-| Product                    | Requests     | Order operations             |
-| -------------------------- | ------------ | ---------------------------- |
-| Spot                       | 1,200/minute | 10/second, 100,000/day       |
-| Futures (USD-M and COIN-M) | 2,400/minute | 300/10 seconds, 1,200/minute |
+| Product                    | Request weight | Order operations             |
+| -------------------------- | -------------- | ---------------------------- |
+| Spot                       | 1,200/minute   | 10/second, 100,000/day       |
+| Futures (USD-M and COIN-M) | 2,400/minute   | 300/10 seconds, 1,200/minute |
 
 The order-count buckets cover submit, OCO submit, batch submit, algo submit, Spot cancel-replace, and
 USD-M modify and batch modify. Cancellations and COIN-M modifications use the request bucket alone.
@@ -1271,11 +1329,14 @@ Non-order authenticated requests, such as leverage and margin-type changes and l
 also use the request bucket alone. Mutations are rejected as `NotSent` when an applicable bucket is empty.
 Futures data and execution clients share the request bucket for matching configurations.
 
-The request bucket counts calls rather than weight, so it does not mirror the venue's weight accounting. A run
-of high-weight or dynamic-weight endpoints (`/api/v3/allOrders` at weight 20, or `/klines` scaling with
-`limit`) spends venue weight faster than the local bucket accounts for. Large history requests may need manual
-pacing. Monitor the `X-MBX-USED-WEIGHT-*` response headers to track actual venue usage. Order book snapshot
-requests also wait on a weight-aware budget. See [Snapshot pacing](#snapshot-pacing).
+The `/fapi/v1/fundingRate` and `/fapi/v1/fundingInfo` endpoints share a USD-M bucket of 500 requests
+per 5 minutes. `/futures/data/openInterestHist` has its own USD-M bucket of 1,000 requests per 5 minutes.
+These endpoints consume no global IP request weight.
+
+Local buckets refill continuously and do not track the venue's exact fixed-window counters or
+traffic from other processes. Monitor `X-MBX-USED-WEIGHT-*` headers and coordinate shared IP usage
+externally; large history requests may still need manual pacing. Order book snapshot requests also
+wait on a separate weight-aware budget. See [Snapshot pacing](#snapshot-pacing).
 
 ### Shared REST backoff
 

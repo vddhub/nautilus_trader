@@ -23,10 +23,17 @@ use std::{
 };
 
 use ahash::{AHashMap, AHashSet};
+use anyhow::Context;
 use dashmap::DashMap;
+use indexmap::IndexMap;
 use jiff::{SignedDuration, Timestamp};
 use nautilus_common::cache::InstrumentLookupError;
-use nautilus_core::{AtomicMap, datetime::SECONDS_IN_DAY, nanos::UnixNanos, time::AtomicTime};
+use nautilus_core::{
+    AtomicMap,
+    datetime::{NANOSECONDS_IN_MILLISECOND, SECONDS_IN_DAY},
+    nanos::UnixNanos,
+    time::AtomicTime,
+};
 use nautilus_model::{
     data::{Bar, BarType, BookOrder, FundingRateUpdate, TradeTick},
     enums::{
@@ -98,6 +105,7 @@ use crate::{
         http::{
             BinanceHttpBackoff, BinanceHttpEndpointScope as BinanceFuturesEndpointScope, sha256,
         },
+        http_weights::request_weight_futures,
         instruments::BinanceInstrumentSelector,
         models::BinanceErrorResponse,
         parse::{
@@ -112,8 +120,12 @@ use crate::{
     futures::conversions::reduce_only_param,
 };
 
+const ORDER_HISTORY_PAGE_LIMIT: u32 = 1_000;
+
 const BINANCE_GLOBAL_RATE_KEY: &str = "binance:global";
 const BINANCE_ORDERS_RATE_KEY: &str = "binance:orders";
+const BINANCE_FUNDING_RATE_KEY: &str = "binance:funding";
+const BINANCE_OPEN_INTEREST_RATE_KEY: &str = "binance:open-interest";
 
 type BinanceFuturesLimiter = RateLimiter<Ustr, MonotonicClock>;
 type BinanceFuturesRateLimiter = Arc<BinanceFuturesLimiter>;
@@ -308,7 +320,21 @@ impl BinanceRawFuturesHttpClient {
 
         let limiter = Arc::new(RateLimiter::new_with_quota(
             None,
-            vec![(Ustr::from(BINANCE_GLOBAL_RATE_KEY), quota)],
+            vec![
+                (Ustr::from(BINANCE_GLOBAL_RATE_KEY), quota),
+                (
+                    Ustr::from(BINANCE_FUNDING_RATE_KEY),
+                    Quota::with_period(Duration::from_millis(600))
+                        .expect("non-zero interval")
+                        .allow_burst(NonZeroU32::new(500).expect("non-zero burst")),
+                ),
+                (
+                    Ustr::from(BINANCE_OPEN_INTEREST_RATE_KEY),
+                    Quota::with_period(Duration::from_millis(300))
+                        .expect("non-zero interval")
+                        .allow_burst(NonZeroU32::new(1000).expect("non-zero burst")),
+                ),
+            ],
         ));
         registry.insert(scope, Arc::downgrade(&limiter));
         limiter
@@ -507,7 +533,7 @@ impl BinanceRawFuturesHttpClient {
             .map_err(|e| BinanceFuturesHttpError::ValidationError(e.to_string()))?;
 
         let encoded_batch = Self::percent_encode(&batch_json);
-        let keys = self.rate_limit_keys(use_order_quota);
+        let keys = self.rate_limit_keys(&method, path, "", use_order_quota);
         self.backoff
             .admit(
                 &self.client,
@@ -674,7 +700,7 @@ impl BinanceRawFuturesHttpClient {
             None => None,
         };
 
-        let keys = self.rate_limit_keys(use_order_quota);
+        let keys = self.rate_limit_keys(&method, path, &query, use_order_quota);
         self.backoff
             .admit(
                 &self.client,
@@ -757,15 +783,32 @@ impl BinanceRawFuturesHttpClient {
         url
     }
 
-    fn rate_limit_keys(&self, use_orders: bool) -> Vec<String> {
+    fn rate_limit_keys(
+        &self,
+        method: &Method,
+        path: &str,
+        query: &str,
+        use_orders: bool,
+    ) -> Vec<Ustr> {
+        let weight =
+            request_weight_futures(method, path, query, self.api_path == BINANCE_DAPI_PATH);
+        let mut keys = vec![Ustr::from(BINANCE_GLOBAL_RATE_KEY); weight as usize];
         if use_orders {
-            let mut keys = Vec::with_capacity(1 + self.order_rate_keys.len());
-            keys.push(BINANCE_GLOBAL_RATE_KEY.to_string());
-            keys.extend(self.order_rate_keys.iter().cloned());
-            keys
-        } else {
-            vec![BINANCE_GLOBAL_RATE_KEY.to_string()]
+            keys.extend(self.order_rate_keys.iter().map(|key| Ustr::from(key)));
         }
+
+        if self.api_path == BINANCE_FAPI_PATH {
+            let path = path.trim_start_matches('/');
+            match path.strip_prefix("fapi/v1/").unwrap_or(path) {
+                "fundingRate" | "fundingInfo" => keys.push(Ustr::from(BINANCE_FUNDING_RATE_KEY)),
+                "futures/data/openInterestHist" => {
+                    keys.push(Ustr::from(BINANCE_OPEN_INTEREST_RATE_KEY));
+                }
+                _ => {}
+            }
+        }
+
+        keys
     }
 
     fn parse_error_response<T>(&self, response: &HttpResponse) -> BinanceFuturesHttpResult<T> {
@@ -1437,19 +1480,14 @@ impl BinanceRawFuturesHttpClient {
                             item.order_id = Some(order_id);
                             item.orig_client_order_id = None;
                         }
-                        Err(BinanceFuturesHttpError::BinanceError {
-                            code: BINANCE_NO_SUCH_ORDER_CODE,
-                            message,
-                            ..
-                        }) => {
-                            results.push(Some(BatchOrderResult::Error(BatchOrderError {
-                                code: BINANCE_NO_SUCH_ORDER_CODE,
-                                msg: message,
-                            })));
+                        Err(e) => {
+                            if let Some(error) = missing_order_lookup_error(&e) {
+                                results.push(Some(BatchOrderResult::Error(error)));
+                                continue;
+                            }
 
-                            continue;
+                            return Err(e);
                         }
-                        Err(e) => return Err(e),
                     }
                 }
 
@@ -1562,17 +1600,13 @@ impl BinanceRawFuturesHttpClient {
                         ));
                         results.push(None);
                     }
-                    Err(BinanceFuturesHttpError::BinanceError {
-                        code: BINANCE_NO_SUCH_ORDER_CODE,
-                        message,
-                        ..
-                    }) => {
-                        results.push(Some(BatchOrderResult::Error(BatchOrderError {
-                            code: BINANCE_NO_SUCH_ORDER_CODE,
-                            msg: message,
-                        })));
+                    Err(e) => {
+                        if let Some(error) = missing_order_lookup_error(&e) {
+                            results.push(Some(BatchOrderResult::Error(error)));
+                        } else {
+                            return Err(e);
+                        }
                     }
-                    Err(e) => return Err(e),
                 }
             }
 
@@ -2010,6 +2044,14 @@ impl BinanceFuturesHttpClient {
         instrument_id: &InstrumentId,
     ) -> Option<InstrumentAny> {
         self.instruments_reconciliation.get_cloned(instrument_id)
+    }
+
+    pub(crate) fn instrument_ids_reconciliation(&self) -> Vec<InstrumentId> {
+        self.instruments_reconciliation
+            .load()
+            .keys()
+            .copied()
+            .collect()
     }
 
     /// Returns whether this client has complete signing credentials.
@@ -2495,6 +2537,146 @@ impl BinanceFuturesHttpClient {
         params: &BinanceAllOrdersParams,
     ) -> BinanceFuturesHttpResult<Vec<BinanceFuturesOrder>> {
         self.inner.query_all_orders(params).await
+    }
+
+    pub(crate) async fn query_order_history(
+        &self,
+        instrument_id: InstrumentId,
+        start: UnixNanos,
+        end: UnixNanos,
+    ) -> anyhow::Result<(
+        IndexMap<i64, BinanceFuturesOrder>,
+        IndexMap<i64, BinanceFuturesAlgoOrder>,
+    )> {
+        const MAX_INTERVAL_MS: i64 = 7 * SECONDS_IN_DAY as i64 * 1_000;
+
+        let symbol = format_binance_symbol(&instrument_id);
+        let end_ms = end.as_i64() / NANOSECONDS_IN_MILLISECOND as i64;
+        let mut window_start = start.as_i64() / NANOSECONDS_IN_MILLISECOND as i64;
+        let mut orders = IndexMap::new();
+        let mut algo_orders = IndexMap::new();
+
+        while window_start <= end_ms {
+            let window_end = window_start.saturating_add(MAX_INTERVAL_MS - 1).min(end_ms);
+            let page = self
+                .query_order_history_window(&symbol, window_start, window_end)
+                .await?;
+            orders.extend(page.into_iter().map(|order| (order.order_id, order)));
+
+            if self.product_type == BinanceProductType::UsdM {
+                let page = self
+                    .query_algo_history_window(&symbol, window_start, window_end)
+                    .await?;
+                algo_orders.extend(page.into_iter().map(|order| (order.algo_id, order)));
+            }
+
+            window_start = window_end + 1;
+        }
+
+        Ok((orders, algo_orders))
+    }
+
+    async fn query_order_history_window(
+        &self,
+        symbol: &str,
+        start: i64,
+        end: i64,
+    ) -> anyhow::Result<Vec<BinanceFuturesOrder>> {
+        let mut orders = Vec::new();
+        let mut order_id = None;
+
+        loop {
+            let params = BinanceAllOrdersParams {
+                symbol: symbol.to_string(),
+                order_id,
+                start_time: order_id.is_none().then_some(start),
+                end_time: order_id.is_none().then_some(end),
+                limit: Some(ORDER_HISTORY_PAGE_LIMIT),
+                recv_window: None,
+            };
+
+            let page = self.query_all_orders(&params).await?;
+            let page_len = page.len();
+
+            let Some(last_id) = page.iter().map(|order| order.order_id).max() else {
+                break;
+            };
+
+            let past_end = page
+                .iter()
+                .any(|order| order.time.is_some_and(|time| time > end));
+            orders.extend(
+                page.into_iter()
+                    .filter(|order| order.time.is_none_or(|time| time <= end)),
+            );
+
+            if page_len < ORDER_HISTORY_PAGE_LIMIT as usize || past_end {
+                break;
+            }
+
+            let next_id = last_id
+                .checked_add(1)
+                .context("Binance Futures order ID overflow during pagination")?;
+            anyhow::ensure!(
+                next_id > order_id.unwrap_or_default(),
+                "Binance Futures order history pagination made no progress"
+            );
+            order_id = Some(next_id);
+        }
+
+        Ok(orders)
+    }
+
+    async fn query_algo_history_window(
+        &self,
+        symbol: &str,
+        start: i64,
+        end: i64,
+    ) -> anyhow::Result<Vec<BinanceFuturesAlgoOrder>> {
+        let mut orders = Vec::new();
+        let mut algo_id = None;
+
+        loop {
+            let params = BinanceAllAlgoOrdersParams {
+                symbol: symbol.to_string(),
+                algo_id,
+                start_time: algo_id.is_none().then_some(start),
+                end_time: algo_id.is_none().then_some(end),
+                page: None,
+                limit: Some(ORDER_HISTORY_PAGE_LIMIT),
+                recv_window: None,
+            };
+
+            let page = self.inner.query_all_algo_orders(&params).await?;
+            let page_len = page.len();
+
+            let Some(last_id) = page.iter().map(|order| order.algo_id).max() else {
+                break;
+            };
+
+            let past_end = page
+                .iter()
+                .any(|order| order.create_time.is_some_and(|time| time > end));
+            orders.extend(
+                page.into_iter()
+                    .filter(|order| order.create_time.is_none_or(|time| time <= end)),
+            );
+
+            if page_len < ORDER_HISTORY_PAGE_LIMIT as usize || past_end {
+                break;
+            }
+
+            let next_id = last_id
+                .checked_add(1)
+                .context("Binance Futures algo ID overflow during pagination")?;
+            anyhow::ensure!(
+                next_id > algo_id.unwrap_or_default(),
+                "Binance Futures algo history pagination made no progress"
+            );
+            algo_id = Some(next_id);
+        }
+
+        Ok(orders)
     }
 
     /// Fetches account information including balances and positions.
@@ -3143,6 +3325,7 @@ impl BinanceFuturesHttpClient {
         let Some(order) = order else {
             return Ok(None);
         };
+
         let actual = if let Some(actual_order_id) = order
             .actual_order_id
             .as_deref()
@@ -3151,27 +3334,8 @@ impl BinanceFuturesHttpClient {
             .transpose()
             .map_err(|e| BinanceFuturesHttpError::ValidationError(e.to_string()))?
         {
-            let params = BinanceOrderQueryParams {
-                symbol: format_binance_symbol(&instrument_id),
-                order_id: Some(actual_order_id),
-                orig_client_order_id: None,
-                recv_window: None,
-            };
-
-            match self.inner.query_order(&params).await {
-                Ok(actual) => Some(actual),
-                Err(
-                    e @ (BinanceFuturesHttpError::MissingCredentials
-                    | BinanceFuturesHttpError::ValidationError(_)),
-                ) => return Err(e),
-                Err(e) => {
-                    log::warn!(
-                        "Failed to enrich algo order with matching-engine order \
-                         {actual_order_id}: {e}; falling back to Algo Service execution fields"
-                    );
-                    None
-                }
-            }
+            self.query_algo_order_actual(instrument_id, actual_order_id)
+                .await?
         } else {
             None
         };
@@ -3180,6 +3344,36 @@ impl BinanceFuturesHttpClient {
             algo: order,
             actual,
         }))
+    }
+
+    pub(crate) async fn query_algo_order_actual(
+        &self,
+        instrument_id: InstrumentId,
+        actual_order_id: i64,
+    ) -> BinanceFuturesHttpResult<Option<BinanceFuturesOrder>> {
+        let params = BinanceOrderQueryParams {
+            symbol: format_binance_symbol(&instrument_id),
+            order_id: Some(actual_order_id),
+            orig_client_order_id: None,
+            recv_window: None,
+        };
+
+        let actual = match self.inner.query_order(&params).await {
+            Ok(actual) => Some(actual),
+            Err(
+                e @ (BinanceFuturesHttpError::MissingCredentials
+                | BinanceFuturesHttpError::ValidationError(_)),
+            ) => return Err(e),
+            Err(e) => {
+                log::warn!(
+                    "Failed to enrich algo order with matching-engine order \
+                     {actual_order_id}: {e}; falling back to Algo Service execution fields"
+                );
+                None
+            }
+        };
+
+        Ok(actual)
     }
 
     /// Requests the current account state.
@@ -3642,15 +3836,9 @@ impl BinanceFuturesHttpClient {
         };
 
         let rates = self.inner.funding_rate(&params).await?;
-        let ts_init = UnixNanos::default();
-
         let mut result = Vec::with_capacity(rates.len());
         for rate in rates {
-            result.push(parse_futures_funding_rate_update(
-                &rate,
-                instrument_id,
-                ts_init,
-            )?);
+            result.push(parse_futures_funding_rate_update(&rate, instrument_id)?);
         }
 
         Ok(result)
@@ -3658,16 +3846,28 @@ impl BinanceFuturesHttpClient {
 }
 
 fn identity_lookup_error(error: BinanceFuturesHttpError) -> BinanceFuturesHttpError {
-    // Preserve admission failures and missing-order codes across cancellation fallback
     match error {
-        BinanceFuturesHttpError::RateLimitBlocked
-        | BinanceFuturesHttpError::BinanceError {
-            code: -2011 | BINANCE_NO_SUCH_ORDER_CODE,
+        BinanceFuturesHttpError::RateLimitBlocked => error,
+        _ => BinanceFuturesHttpError::IdentityLookup(Box::new(error)),
+    }
+}
+
+fn missing_order_lookup_error(error: &BinanceFuturesHttpError) -> Option<BatchOrderError> {
+    let BinanceFuturesHttpError::IdentityLookup(source) = error else {
+        return None;
+    };
+
+    match source.as_ref() {
+        BinanceFuturesHttpError::BinanceError {
+            code: BINANCE_NO_SUCH_ORDER_CODE,
+            message,
             ..
-        } => error,
-        _ => BinanceFuturesHttpError::ValidationError(format!(
-            "Order identity lookup failed before submission: {error}"
-        )),
+        } => Some(BatchOrderError {
+            code: BINANCE_NO_SUCH_ORDER_CODE,
+            msg: message.clone(),
+            not_sent: true,
+        }),
+        _ => None,
     }
 }
 
@@ -3812,20 +4012,19 @@ fn parse_futures_kline_binance_bar(
 fn parse_futures_funding_rate_update(
     rate: &BinanceFundingRate,
     instrument_id: InstrumentId,
-    ts_init: UnixNanos,
 ) -> anyhow::Result<FundingRateUpdate> {
     let funding_rate = rate.funding_rate.parse::<Decimal>().map_err(|e| {
         anyhow::anyhow!("invalid Futures funding rate at {}: {e}", rate.funding_time)
     })?;
-    let ts_event = parse_millis(rate.funding_time, "Futures funding time")?;
 
+    let ts_event = parse_millis(rate.funding_time, "Futures funding time")?;
     Ok(FundingRateUpdate::new(
         instrument_id,
         funding_rate,
         None, // Funding interval is not provided by the history endpoint
         None, // Next funding time is not provided by the history endpoint
         ts_event,
-        ts_init,
+        ts_event,
     ))
 }
 
@@ -3899,9 +4098,12 @@ pub(crate) fn order_type_to_binance_futures(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use axum::{Router, http::Method, response::IntoResponse, routing::any};
     use nautilus_core::time::get_atomic_clock_realtime;
     use nautilus_live::execution::failure::CommandFailure;
+    use nautilus_model::enums::OrderStatus;
     use nautilus_network::http::{HttpStatus, StatusCode};
     use nautilus_testkit::http::assert_http_redirect_rejected;
     use rstest::rstest;
@@ -3909,6 +4111,815 @@ mod tests {
 
     use super::*;
     use crate::common::{enums::BinanceTradingStatus, failure::classify_futures_http_failure};
+
+    #[rstest]
+    #[case::usd_regular(
+        BinanceProductType::UsdM,
+        false,
+        "BTCUSDT-PERP.BINANCE",
+        "BTCUSDT",
+        "/fapi/v1/"
+    )]
+    #[case::usd_algo(
+        BinanceProductType::UsdM,
+        true,
+        "BTCUSDT-PERP.BINANCE",
+        "BTCUSDT",
+        "/fapi/v1/"
+    )]
+    #[case::coin_regular(
+        BinanceProductType::CoinM,
+        false,
+        "BTCUSD_PERP.BINANCE",
+        "BTCUSD_PERP",
+        "/dapi/v1/"
+    )]
+    #[tokio::test]
+    async fn test_order_history_pages_with_fixed_cutoff(
+        #[case] product: BinanceProductType,
+        #[case] page_algo: bool,
+        #[case] instrument: &str,
+        #[case] symbol: &str,
+        #[case] prefix: &str,
+    ) {
+        let captured = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(any(order_history_response))
+            .with_state((page_algo, captured.clone()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = BinanceFuturesHttpClient::new(
+            product,
+            BinanceEnvironment::Live,
+            get_atomic_clock_realtime(),
+            Some("key".into()),
+            Some("secret".into()),
+            Some(url),
+            None,
+            Some(1),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (orders, algos) = client
+            .query_order_history(
+                InstrumentId::from(instrument),
+                10_000_000.into(),
+                20_000_000.into(),
+            )
+            .await
+            .unwrap();
+        let instrument_id = InstrumentId::from(instrument);
+
+        let report = orders[&8_886_774]
+            .to_order_status_report(
+                "BINANCE-001".into(),
+                instrument_id,
+                2,
+                if product == BinanceProductType::CoinM {
+                    0
+                } else {
+                    3
+                },
+                false,
+                20_000_000.into(),
+            )
+            .unwrap();
+
+        let qty = if product == BinanceProductType::CoinM {
+            Quantity::from("1")
+        } else {
+            Quantity::from("0.001")
+        };
+
+        let requests = captured.lock();
+
+        let paged_endpoint = if page_algo {
+            "allAlgoOrders"
+        } else {
+            "allOrders"
+        };
+
+        let pages: Vec<_> = requests
+            .iter()
+            .filter(|(path, _)| path.ends_with(paged_endpoint))
+            .collect();
+
+        let cursor = if page_algo { "algoId" } else { "orderId" };
+
+        assert_eq!(report.instrument_id, instrument_id);
+        assert_eq!(report.venue_order_id, VenueOrderId::from("8886774"));
+        assert_eq!(
+            report.client_order_id,
+            Some(ClientOrderId::from("testOrder123"))
+        );
+        assert_eq!(report.order_status, OrderStatus::Filled);
+        assert_eq!(report.quantity, qty);
+        assert_eq!(report.filled_qty, qty);
+        assert_eq!(report.avg_px, Some(rust_decimal_macros::dec!(50000)));
+        assert_eq!(orders.len(), if page_algo { 1 } else { 1_001 });
+        assert_eq!(orders[&8_886_774].symbol.as_str(), symbol);
+        assert_eq!(orders[&8_886_774].order_id, 8_886_774);
+        assert_eq!(
+            algos.len(),
+            if product == BinanceProductType::CoinM {
+                0
+            } else if page_algo {
+                1_001
+            } else {
+                1
+            }
+        );
+        assert_eq!(pages.len(), 2);
+        assert!(!pages[0].1.contains_key(cursor));
+        assert_eq!(pages[1].1[cursor], "1001");
+
+        for (path, query) in requests.iter() {
+            assert!(path.starts_with(prefix));
+            assert_eq!(query["symbol"], symbol);
+
+            if query.contains_key("algoId") || query.contains_key("orderId") {
+                assert!(!query.contains_key("startTime"));
+                assert!(!query.contains_key("endTime"));
+            } else {
+                assert_eq!(query["startTime"], "10");
+                assert_eq!(query["endTime"], "20");
+            }
+
+            assert_eq!(query["limit"], "1000");
+            assert!(!query.contains_key("page"));
+        }
+
+        if product == BinanceProductType::CoinM {
+            assert_eq!(requests.len(), 2);
+        } else {
+            assert_eq!(requests.len(), 3);
+            assert_eq!(algos[&8_886_774].symbol.as_str(), symbol);
+        }
+
+        server.abort();
+    }
+
+    #[rstest]
+    #[case::usd(BinanceProductType::UsdM, "/fapi/v1/", "BTCUSDT-PERP.BINANCE")]
+    #[case::coin(BinanceProductType::CoinM, "/dapi/v1/", "BTCUSD_PERP.BINANCE")]
+    #[tokio::test]
+    async fn test_order_history_windows_are_contiguous(
+        #[case] product: BinanceProductType,
+        #[case] prefix: &str,
+        #[case] instrument: &str,
+    ) {
+        let captured = HistoryRequests::default();
+
+        let app = Router::new()
+            .fallback(any(
+                |axum::extract::State(requests): axum::extract::State<HistoryRequests>,
+                 uri: axum::http::Uri,
+                 axum::extract::Query(query): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    requests.lock().push((uri.path().to_string(), query));
+                    axum::Json(serde_json::json!([]))
+                },
+            ))
+            .with_state(captured.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = BinanceFuturesHttpClient::new(
+            product,
+            BinanceEnvironment::Live,
+            get_atomic_clock_realtime(),
+            Some("key".into()),
+            Some("secret".into()),
+            Some(url),
+            None,
+            Some(1),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (orders, algos) = client
+            .query_order_history(
+                InstrumentId::from(instrument),
+                10_000_000.into(),
+                1_209_600_133_000_000.into(),
+            )
+            .await
+            .unwrap();
+        let requests = captured.lock();
+
+        let endpoints = if product == BinanceProductType::UsdM {
+            vec!["allOrders", "allAlgoOrders"]
+        } else {
+            vec!["allOrders"]
+        };
+
+        let windows = [
+            (10, 604_800_009),
+            (604_800_010, 1_209_600_009),
+            (1_209_600_010, 1_209_600_133),
+        ];
+
+        assert!(orders.is_empty());
+        assert!(algos.is_empty());
+        assert_eq!(requests.len(), windows.len() * endpoints.len());
+
+        for ((path, query), ((start, end), endpoint)) in requests.iter().zip(
+            windows
+                .iter()
+                .flat_map(|window| endpoints.iter().map(move |endpoint| (window, endpoint))),
+        ) {
+            assert_eq!(path, &format!("{prefix}{endpoint}"));
+            assert_eq!(query["startTime"], start.to_string());
+            assert_eq!(query["endTime"], end.to_string());
+            assert_eq!(query["limit"], "1000");
+            assert!(!query.contains_key("orderId"));
+            assert!(!query.contains_key("algoId"));
+        }
+
+        server.abort();
+    }
+
+    type HistoryRequests =
+        Arc<parking_lot::Mutex<Vec<(String, std::collections::HashMap<String, String>)>>>;
+
+    async fn order_history_response(
+        axum::extract::State((page_algo, requests)): axum::extract::State<(bool, HistoryRequests)>,
+        uri: axum::http::Uri,
+        axum::extract::Query(query): axum::extract::Query<
+            std::collections::HashMap<String, String>,
+        >,
+    ) -> axum::response::Response {
+        let algo = uri.path().ends_with("allAlgoOrders");
+
+        let (cursor, mut template) = if algo {
+            let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+                "../../../test_data/futures/http_json/open_algo_orders.json"
+            ))
+            .unwrap();
+            ("algoId", rows[0].clone())
+        } else {
+            let row = serde_json::from_str(include_str!(
+                "../../../test_data/futures/http_json/order_response.json"
+            ))
+            .unwrap();
+            ("orderId", row)
+        };
+
+        let first_page = !query.contains_key(cursor);
+        if !first_page && (query.contains_key("startTime") || query.contains_key("endTime")) {
+            return (axum::http::StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"code": -1106, "msg": "Cursor cannot accompany time bounds"}))).into_response();
+        }
+
+        requests
+            .lock()
+            .push((uri.path().to_string(), query.clone()));
+
+        let qty = if query["symbol"] == "BTCUSD_PERP" {
+            "1"
+        } else {
+            "0.001"
+        };
+
+        template["symbol"] = serde_json::json!(query["symbol"]);
+        template["status"] = serde_json::json!("FILLED");
+        template["origQty"] = serde_json::json!(qty);
+        template["executedQty"] = serde_json::json!(qty);
+        template["avgPrice"] = serde_json::json!("50000.00");
+
+        let ids: Vec<_> = if algo == page_algo && first_page {
+            (1..=1_000).collect()
+        } else {
+            vec![8_886_774, 8_886_775]
+        };
+
+        let rows: Vec<_> = ids
+            .into_iter()
+            .map(|value| {
+                let mut row = template.clone();
+                row[cursor] = serde_json::json!(value);
+
+                let timestamp = if value == 8_886_775 { 21 } else { 15 };
+                row["time"] = serde_json::json!(timestamp);
+                row["createTime"] = serde_json::json!(timestamp);
+                row["updateTime"] = serde_json::json!(timestamp);
+                row
+            })
+            .collect();
+
+        axum::Json(rows).into_response()
+    }
+
+    #[rstest]
+    #[case::usd_m(BinanceProductType::UsdM)]
+    #[case::coin_m(BinanceProductType::CoinM)]
+    #[tokio::test]
+    async fn test_weighted_zero_ip_order_keeps_order_quota(#[case] product: BinanceProductType) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let captured = requests.clone();
+        let response = include_str!("../../../test_data/futures/http_json/order_response.json");
+
+        let app = Router::new().fallback(any(move || {
+            let captured = captured.clone();
+            async move {
+                captured.fetch_add(1, Ordering::Relaxed);
+                response
+            }
+        }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut client = BinanceRawFuturesHttpClient::new(
+            product,
+            BinanceEnvironment::Live,
+            Some("key".into()),
+            Some("secret".into()),
+            Some(url),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let quota = Quota::with_period(Duration::from_secs(3600)).unwrap();
+        let mut quotas = vec![(Ustr::from(BINANCE_GLOBAL_RATE_KEY), quota)];
+        quotas.extend(
+            client
+                .order_rate_keys
+                .iter()
+                .map(|key| (Ustr::from(key), quota)),
+        );
+        let limiter = Arc::new(RateLimiter::new_with_quota(None, quotas));
+        client.client = HttpClient::builder()
+            .rate_limiters(vec![limiter.clone()])
+            .build()
+            .unwrap();
+        assert_eq!(
+            limiter.check_key(&Ustr::from(BINANCE_GLOBAL_RATE_KEY)),
+            Ok(())
+        );
+
+        let first = client
+            .post::<(), serde_json::Value>("order", None, None, true, true)
+            .await;
+        let blocked = client
+            .post::<(), serde_json::Value>("order", None, None, true, true)
+            .await;
+        let orders_exhausted = client
+            .order_rate_keys
+            .iter()
+            .all(|key| limiter.check_key(&Ustr::from(key)).is_err());
+        server.abort();
+
+        assert_eq!(
+            first.unwrap(),
+            serde_json::from_str::<serde_json::Value>(response).unwrap()
+        );
+        assert!(matches!(
+            blocked,
+            Err(BinanceFuturesHttpError::RateLimitBlocked)
+        ));
+        assert!(orders_exhausted);
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[rstest]
+    #[case::usd_m(BinanceProductType::UsdM)]
+    #[case::coin_m(BinanceProductType::CoinM)]
+    #[tokio::test]
+    async fn test_weighted_batch_keeps_single_order_quota(#[case] product: BinanceProductType) {
+        let response = include_str!("../../../test_data/futures/http_json/order_response.json");
+        let batch_response = format!("[{response}]");
+        let app = Router::new().fallback(any(move || {
+            let response = batch_response.clone();
+            async move { response }
+        }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut client = BinanceRawFuturesHttpClient::new(
+            product,
+            BinanceEnvironment::Live,
+            Some("key".into()),
+            Some("secret".into()),
+            Some(url),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let quota = Quota::with_period(Duration::from_secs(3600)).unwrap();
+        let mut quotas = vec![(
+            Ustr::from(BINANCE_GLOBAL_RATE_KEY),
+            quota.allow_burst(NonZeroU32::new(5).unwrap()),
+        )];
+        quotas.extend(
+            client
+                .order_rate_keys
+                .iter()
+                .map(|key| (Ustr::from(key), quota)),
+        );
+        let limiter = Arc::new(RateLimiter::new_with_quota(None, quotas));
+        client.client = HttpClient::builder()
+            .rate_limiters(vec![limiter.clone()])
+            .build()
+            .unwrap();
+
+        let result = client
+            .batch_request("batchOrders", &[()], true)
+            .await
+            .unwrap();
+        let ip_exhausted = limiter
+            .check_key(&Ustr::from(BINANCE_GLOBAL_RATE_KEY))
+            .is_err();
+        let orders_exhausted = client
+            .order_rate_keys
+            .iter()
+            .all(|key| limiter.check_key(&Ustr::from(key)).is_err());
+        server.abort();
+
+        assert_eq!(result.len(), 1);
+
+        let BatchOrderResult::Success(order) = &result[0] else {
+            panic!("Expected a successful batch response");
+        };
+
+        let expected: BinanceFuturesOrder = serde_json::from_str(response).unwrap();
+        assert_eq!(
+            serde_json::to_value(order).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert!(ip_exhausted);
+        assert!(orders_exhausted);
+    }
+
+    #[rstest]
+    #[case("fundingRate", BINANCE_FUNDING_RATE_KEY)]
+    #[case("fundingInfo", BINANCE_FUNDING_RATE_KEY)]
+    #[case("/fapi/v1/fundingRate", BINANCE_FUNDING_RATE_KEY)]
+    #[case("/futures/data/openInterestHist", BINANCE_OPEN_INTEREST_RATE_KEY)]
+    #[tokio::test]
+    async fn test_weighted_zero_ip_reads_enforce_private_quota(
+        #[case] path: &str,
+        #[case] key: &str,
+    ) {
+        let mut client = BinanceRawFuturesHttpClient::new(
+            BinanceProductType::UsdM,
+            BinanceEnvironment::Live,
+            None,
+            None,
+            Some("http://127.0.0.1:1".into()),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .for_command(false);
+        let quota = Quota::with_period(Duration::from_secs(3600)).unwrap();
+
+        let limiter = Arc::new(RateLimiter::new_with_quota(
+            None,
+            vec![
+                (Ustr::from(BINANCE_GLOBAL_RATE_KEY), quota),
+                (Ustr::from(key), quota),
+            ],
+        ));
+        client.client = HttpClient::builder()
+            .rate_limiters(vec![limiter.clone()])
+            .build()
+            .unwrap();
+        assert_eq!(limiter.check_key(&Ustr::from(key)), Ok(()));
+
+        let result = client
+            .get::<(), serde_json::Value>(path, None, false, false)
+            .await;
+        let ip_available = limiter.check_key(&Ustr::from(BINANCE_GLOBAL_RATE_KEY));
+
+        assert!(matches!(
+            result,
+            Err(BinanceFuturesHttpError::RateLimitBlocked)
+        ));
+        assert_eq!(ip_available, Ok(()));
+        assert_eq!(
+            client.rate_limit_keys(&Method::GET, path, "", false),
+            vec![Ustr::from(key)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_weighted_concurrent_clients_share_atomic_quota() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let captured = requests.clone();
+        let response = include_str!("../../../test_data/spot/http_json/server_time_response.json");
+
+        let app = Router::new().fallback(any(move || {
+            let captured = captured.clone();
+            async move {
+                captured.fetch_add(1, Ordering::Relaxed);
+                response
+            }
+        }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let quota = Quota::with_period(Duration::from_secs(3600))
+            .unwrap()
+            .allow_burst(NonZeroU32::new(30).unwrap());
+
+        let scope = BinanceFuturesRequestScope {
+            endpoint: BinanceFuturesEndpointScope::new(
+                BinanceProductType::UsdM,
+                BinanceEnvironment::Live,
+                Some(&url),
+            ),
+            proxy_url_digest: None,
+        };
+
+        let limiter = BinanceRawFuturesHttpClient::request_rate_limiter(scope, quota);
+        let client = BinanceRawFuturesHttpClient::new(
+            BinanceProductType::UsdM,
+            BinanceEnvironment::Live,
+            Some("key".into()),
+            Some("secret".into()),
+            Some(url.clone()),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .for_command(false);
+        let other = BinanceRawFuturesHttpClient::new(
+            BinanceProductType::CoinM,
+            BinanceEnvironment::Live,
+            None,
+            None,
+            Some(url.clone()),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .for_command(false);
+
+        let (first, second) = tokio::join!(
+            async {
+                client
+                    .get::<(), serde_json::Value>("aggTrades", None, false, false)
+                    .await
+            },
+            async {
+                other
+                    .get::<(), serde_json::Value>("aggTrades", None, false, false)
+                    .await
+            }
+        );
+        let successes = usize::from(first.is_ok()) + usize::from(second.is_ok());
+        let blocked = usize::from(matches!(
+            first,
+            Err(BinanceFuturesHttpError::RateLimitBlocked)
+        )) + usize::from(matches!(
+            second,
+            Err(BinanceFuturesHttpError::RateLimitBlocked)
+        ));
+        let mut remaining = 0;
+        while limiter
+            .check_key(&Ustr::from(BINANCE_GLOBAL_RATE_KEY))
+            .is_ok()
+        {
+            remaining += 1;
+        }
+
+        server.abort();
+
+        assert_eq!(successes, 1);
+        assert_eq!(blocked, 1);
+        assert_eq!(remaining, 10);
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_weighted_history_pages_consume_each_page() {
+        let cursors = Arc::new(Mutex::new(Vec::new()));
+        let captured = cursors.clone();
+        let response = include_str!("../../../test_data/spot/http_json/server_time_response.json");
+
+        let app = Router::new().fallback(any(move |uri: axum::http::Uri| {
+            let captured = captured.clone();
+            async move {
+                let query: AHashMap<String, String> =
+                    serde_urlencoded::from_str(uri.query().unwrap()).unwrap();
+                captured.lock().push(query["fromId"].clone());
+                response
+            }
+        }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let quota = Quota::with_period(Duration::from_secs(3600))
+            .unwrap()
+            .allow_burst(NonZeroU32::new(10).unwrap());
+
+        let limiter = Arc::new(RateLimiter::new_with_quota(
+            None,
+            vec![(Ustr::from(BINANCE_GLOBAL_RATE_KEY), quota)],
+        ));
+        let mut client = BinanceRawFuturesHttpClient::new(
+            BinanceProductType::UsdM,
+            BinanceEnvironment::Live,
+            Some("key".into()),
+            Some("secret".into()),
+            Some(url.clone()),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .for_command(false);
+        client.client = HttpClient::builder()
+            .rate_limiters(vec![limiter.clone()])
+            .build()
+            .unwrap();
+        let mut responses = Vec::new();
+
+        for from_id in [1, 101] {
+            let params = [
+                ("symbol", "BTCUSDT".to_string()),
+                ("fromId", from_id.to_string()),
+            ];
+            responses.push(
+                client
+                    .get::<_, serde_json::Value>("userTrades", Some(&params), true, false)
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let exhausted = limiter
+            .check_key(&Ustr::from(BINANCE_GLOBAL_RATE_KEY))
+            .is_err();
+        server.abort();
+
+        assert_eq!(
+            responses,
+            vec![serde_json::from_str::<serde_json::Value>(response).unwrap(); 2]
+        );
+        assert_eq!(*cursors.lock(), ["1", "101"]);
+        assert!(exhausted);
+    }
+
+    #[rstest]
+    #[case("time", 1)]
+    #[case("aggTrades", 20)]
+    #[tokio::test]
+    async fn test_weighted_request_consumes_endpoint_cost(#[case] path: &str, #[case] weight: u32) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let captured = requests.clone();
+        let response = include_str!("../../../test_data/spot/http_json/server_time_response.json");
+
+        let app = Router::new().fallback(any(move || {
+            let captured = captured.clone();
+            async move {
+                captured.fetch_add(1, Ordering::Relaxed);
+                response
+            }
+        }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let quota = Quota::with_period(Duration::from_secs(3600))
+            .unwrap()
+            .allow_burst(NonZeroU32::new(weight).unwrap());
+
+        let limiter = Arc::new(RateLimiter::new_with_quota(
+            None,
+            vec![(Ustr::from(BINANCE_GLOBAL_RATE_KEY), quota)],
+        ));
+        let mut client = BinanceRawFuturesHttpClient::new(
+            BinanceProductType::UsdM,
+            BinanceEnvironment::Live,
+            None,
+            None,
+            Some(url),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .for_command(false);
+        client.client = HttpClient::builder()
+            .rate_limiters(vec![limiter.clone()])
+            .build()
+            .unwrap();
+
+        let first = client
+            .get::<(), serde_json::Value>(path, None, false, false)
+            .await;
+        let blocked = client
+            .get::<(), serde_json::Value>("time", None, false, false)
+            .await;
+        let exhausted = limiter
+            .check_key(&Ustr::from(BINANCE_GLOBAL_RATE_KEY))
+            .is_err();
+        server.abort();
+
+        assert_eq!(
+            first.unwrap(),
+            serde_json::from_str::<serde_json::Value>(response).unwrap()
+        );
+        assert!(matches!(
+            blocked,
+            Err(BinanceFuturesHttpError::RateLimitBlocked)
+        ));
+        assert!(exhausted);
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_weighted_read_retry_consumes_each_attempt() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let captured = requests.clone();
+        let response = include_str!("../../../test_data/spot/http_json/server_time_response.json");
+
+        let app = Router::new().fallback(any(move || {
+            let captured = captured.clone();
+            async move {
+                if captured.fetch_add(1, Ordering::Relaxed) == 0 {
+                    (StatusCode::SERVICE_UNAVAILABLE, "retry").into_response()
+                } else {
+                    (StatusCode::OK, response).into_response()
+                }
+            }
+        }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let quota = Quota::with_period(Duration::from_secs(3600))
+            .unwrap()
+            .allow_burst(NonZeroU32::new(40).unwrap());
+
+        let limiter = Arc::new(RateLimiter::new_with_quota(
+            None,
+            vec![(Ustr::from(BINANCE_GLOBAL_RATE_KEY), quota)],
+        ));
+        let mut client = BinanceRawFuturesHttpClient::new(
+            BinanceProductType::UsdM,
+            BinanceEnvironment::Live,
+            None,
+            None,
+            Some(url),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        client.client = HttpClient::builder()
+            .rate_limiters(vec![limiter.clone()])
+            .build()
+            .unwrap();
+
+        client.retry_manager = Arc::new(RetryManager::new(RetryConfig {
+            max_retries: 1,
+            initial_delay_ms: 1,
+            max_delay_ms: 1,
+            jitter_ms: 0,
+            ..crate::common::http::retry_config()
+        }));
+
+        let path = "aggTrades";
+        let result = client
+            .get::<(), serde_json::Value>(path, None, false, false)
+            .await;
+        let exhausted = limiter
+            .check_key(&Ustr::from(BINANCE_GLOBAL_RATE_KEY))
+            .is_err();
+        server.abort();
+
+        assert_eq!(
+            result.unwrap(),
+            serde_json::from_str::<serde_json::Value>(response).unwrap()
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        assert!(exhausted);
+    }
 
     #[rstest]
     #[case::usd_m(BinanceProductType::UsdM)]
@@ -4209,15 +5220,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            client.rate_limit_keys(false),
-            vec![BINANCE_GLOBAL_RATE_KEY.to_string()]
+            client.rate_limit_keys(&Method::GET, "time", "", false),
+            vec![Ustr::from(BINANCE_GLOBAL_RATE_KEY)]
         );
         assert_eq!(
-            client.rate_limit_keys(true),
+            client.rate_limit_keys(&Method::DELETE, "order", "", true),
             vec![
-                BINANCE_GLOBAL_RATE_KEY.to_string(),
-                "binance:orders:10:Second".to_string(),
-                "binance:orders:1:Minute".to_string(),
+                Ustr::from(BINANCE_GLOBAL_RATE_KEY),
+                Ustr::from("binance:orders:10:Second"),
+                Ustr::from("binance:orders:1:Minute"),
             ]
         );
     }

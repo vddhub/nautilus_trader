@@ -82,6 +82,9 @@ audit-as-crates-io = false
 [policy.nautilus-execution]
 audit-as-crates-io = false
 
+[policy.nautilus-finfeed]
+audit-as-crates-io = false
+
 [policy.nautilus-hyperliquid]
 audit-as-crates-io = false
 
@@ -2619,10 +2622,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.web-sys]]
 version = "0.3.103"
-criteria = "safe-to-deploy"
-
-[[exemptions.webpki-root-certs]]
-version = "1.0.9"
 criteria = "safe-to-deploy"
 
 [[exemptions.webpki-roots]]

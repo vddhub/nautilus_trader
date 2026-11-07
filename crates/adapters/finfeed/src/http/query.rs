@@ -19,6 +19,7 @@ use jiff::{Timestamp, civil::Date};
 use serde::{Serialize, Serializer};
 
 use super::error::Error;
+use crate::common::enums::OhlcvInterval;
 
 /// Maximum listing, active-ID, activity, and historical trade/quote/book page size.
 pub const PAGE_LIMIT_MAX: u32 = 10_000;
@@ -222,7 +223,7 @@ impl HistoryQuery {
 )]
 pub struct FlatFileOhlcvQuery {
     /// Flat-file aggregation period: `1SEC`, `1MIN`, or `1HRS`.
-    pub period: String,
+    pub period: OhlcvInterval,
     /// Date or time selectors and response limit for the flat-file source.
     #[serde(flatten)]
     pub history: HistoryQuery,
@@ -230,7 +231,12 @@ pub struct FlatFileOhlcvQuery {
 
 impl FlatFileOhlcvQuery {
     pub(super) fn validate(&self) -> Result<(), Error> {
-        if !matches!(self.period.as_str(), "1SEC" | "1MIN" | "1HRS") {
+        let period = OhlcvInterval::from(self.period.as_ref());
+
+        if !matches!(
+            period,
+            OhlcvInterval::Second1 | OhlcvInterval::Minute1 | OhlcvInterval::Hour1
+        ) {
             return Err(Error::Validation(
                 "flat-file period must be 1SEC, 1MIN, or 1HRS".into(),
             ));
@@ -260,7 +266,7 @@ impl FlatFileOhlcvQuery {
 )]
 pub struct OhlcvQuery {
     /// Nonblank identifier from the provider period catalog.
-    pub period_id: String,
+    pub period_id: OhlcvInterval,
     /// Optional start timestamp; required for exchange-wide history and rejected for latest bars.
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -281,7 +287,7 @@ impl OhlcvQuery {
     pub(super) fn validate(&self, latest: bool) -> Result<(), Error> {
         validate_limit(self.limit, OHLCV_LIMIT_MAX)?;
 
-        if self.period_id.trim().is_empty()
+        if self.period_id.as_ref().trim().is_empty()
             || (latest && (self.time_start.is_some() || self.time_end.is_some()))
         {
             return Err(Error::Validation(
@@ -381,5 +387,45 @@ fn serialize_time<S: Serializer>(
     match time {
         Some(time) => serializer.collect_str(&format_args!("{time:.7}")),
         None => serializer.serialize_none(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case(OhlcvInterval::Second1, true)]
+    #[case(OhlcvInterval::Minute1, true)]
+    #[case(OhlcvInterval::Hour1, true)]
+    #[case(OhlcvInterval::Other("1SEC".into()), true)]
+    #[case(OhlcvInterval::Other("1MIN".into()), true)]
+    #[case(OhlcvInterval::Other("1HRS".into()), true)]
+    #[case(OhlcvInterval::Second2, false)]
+    #[case(OhlcvInterval::Other("1min".into()), false)]
+    #[case(OhlcvInterval::Other("future-period".into()), false)]
+    fn flat_file_period_validation_preserves_raw_labels(
+        #[case] period: OhlcvInterval,
+        #[case] valid: bool,
+    ) {
+        let query = FlatFileOhlcvQuery {
+            period,
+            history: HistoryQuery {
+                date: Some("2026-10-11".parse().unwrap()),
+                time_start: None,
+                time_end: None,
+                limit: 17,
+            },
+        };
+
+        let expected = if valid {
+            Ok(())
+        } else {
+            Err("Invalid FinFeed request: flat-file period must be 1SEC, 1MIN, or 1HRS".to_owned())
+        };
+
+        assert_eq!(query.validate().map_err(|e| e.to_string()), expected);
     }
 }

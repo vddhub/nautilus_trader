@@ -153,16 +153,20 @@ METHOD_DOC_SOURCES = {
     ("PyCache", "quotes"): ("Cache", "quotes"),
     ("PyCache", "trades"): ("Cache", "trades"),
     ("PyCache", "bars"): ("Cache", "bars"),
-    ("PyCache", "mark_price"): ("Cache", "mark_price"),
+    ("PyCache", "mark_price"): ("Cache", "mark_price_at_index"),
     ("PyCache", "mark_prices"): ("Cache", "mark_prices"),
-    ("PyCache", "index_price"): ("Cache", "index_price"),
+    ("PyCache", "index_price"): ("Cache", "index_price_at_index"),
     ("PyCache", "index_prices"): ("Cache", "index_prices"),
-    ("PyCache", "funding_rate"): ("Cache", "funding_rate"),
+    ("PyCache", "funding_rate"): ("Cache", "funding_rate_at_index"),
     ("PyCache", "funding_rates"): ("Cache", "funding_rates"),
     ("PyCache", "instrument_status"): ("Cache", "instrument_status"),
     ("PyCache", "instrument_statuses"): ("Cache", "instrument_statuses"),
     ("PyCache", "instrument_close"): ("Cache", "instrument_close"),
     ("PyCache", "order_book"): ("Cache", "order_book"),
+    ("PyPolymarketPositionClient", "approve_v2_trading"): (
+        "PolymarketPositionClient",
+        "approve_v2_trading",
+    ),
 }
 
 BANNER_RE = re.compile(r"^-{3,}.*-{3,}$")

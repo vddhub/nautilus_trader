@@ -33,12 +33,15 @@ mod orders;
 mod reports;
 mod responses;
 
-use std::sync::{Arc, atomic::AtomicBool};
+use std::{
+    cell::RefCell,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use anyhow::Context;
 use async_trait::async_trait;
 use nautilus_common::{
-    clients::ExecutionClient,
+    clients::{ExecutionClient, ExecutionReportTask},
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
@@ -113,6 +116,7 @@ pub struct PolymarketExecutionClient {
     decline_observer: Option<TypedHandler<OrderEventAny>>,
     shared_token_instruments: Arc<AtomicMap<Ustr, InstrumentAny>>,
     neg_risk_index: Arc<AtomicMap<InstrumentId, bool>>,
+    instruments_pending: RefCell<Option<Vec<InstrumentAny>>>,
     pending_submits: PendingSubmitTracker,
     pending_cancels: PendingCancelTracker,
     order_contexts: Arc<OrderContextRegistry>,
@@ -249,6 +253,7 @@ impl PolymarketExecutionClient {
             decline_observer: None,
             shared_token_instruments: Arc::new(AtomicMap::new()),
             neg_risk_index: Arc::new(AtomicMap::new()),
+            instruments_pending: RefCell::new(Some(Vec::new())),
             pending_submits: PendingSubmitTracker::default(),
             pending_cancels: PendingCancelTracker::default(),
             order_contexts: Arc::new(OrderContextRegistry::default()),
@@ -395,13 +400,14 @@ impl ExecutionClient for PolymarketExecutionClient {
         self.check_not_faulted()?;
 
         if let Err(e) = self.settlement.ensure_submission_allowed() {
-            self.emitter.emit_order_modify_rejected_event(
+            self.emitter.emit_order_modify_denied_event(
                 cmd.strategy_id,
                 cmd.instrument_id,
                 cmd.client_order_id,
                 cmd.venue_order_id,
                 &e.to_string(),
                 self.clock.get_time_ns(),
+                Some(cmd.command_id),
             );
             return Ok(());
         }
@@ -452,7 +458,11 @@ impl ExecutionClient for PolymarketExecutionClient {
     }
 
     fn on_instrument(&mut self, instrument: InstrumentAny) {
-        self.on_instrument_update(&instrument);
+        if let Some(pending) = self.instruments_pending.get_mut() {
+            pending.push(instrument);
+        } else {
+            self.on_instrument_update(&instrument);
+        }
     }
 
     fn calculate_commission(
@@ -474,6 +484,34 @@ impl ExecutionClient for PolymarketExecutionClient {
         self.disconnect_client().await
     }
 
+    fn generate_order_status_report_task(
+        &self,
+        cmd: &GenerateOrderStatusReport,
+    ) -> Option<ExecutionReportTask<Option<OrderStatusReport>>> {
+        Some(self.order_status_report_task(cmd))
+    }
+
+    fn generate_order_status_reports_task(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+    ) -> Option<ExecutionReportTask<Vec<OrderStatusReport>>> {
+        self.order_status_reports_task(cmd)
+    }
+
+    fn generate_fill_reports_task(
+        &self,
+        cmd: &GenerateFillReports,
+    ) -> Option<ExecutionReportTask<Vec<FillReport>>> {
+        Some(self.fill_reports_task(cmd))
+    }
+
+    fn generate_position_status_reports_task(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+    ) -> Option<ExecutionReportTask<Vec<PositionStatusReport>>> {
+        Some(self.position_status_reports_task(cmd))
+    }
+
     async fn generate_order_status_report(
         &self,
         cmd: &GenerateOrderStatusReport,
@@ -481,7 +519,7 @@ impl ExecutionClient for PolymarketExecutionClient {
         gate_report(
             || {
                 self.settlement
-                    .ensure_resolved(cmd.instrument_id, "order status report")
+                    .ensure_order_status_available(cmd.instrument_id, "order status report")
             },
             Box::pin(self.generate_order_status_report_impl(cmd)),
         )
@@ -495,7 +533,7 @@ impl ExecutionClient for PolymarketExecutionClient {
         gate_report(
             || {
                 self.settlement
-                    .ensure_resolved(cmd.instrument_id, "order status reports")
+                    .ensure_order_status_available(cmd.instrument_id, "order status reports")
             },
             self.generate_order_status_reports_impl(cmd),
         )
@@ -516,7 +554,7 @@ impl ExecutionClient for PolymarketExecutionClient {
                     .settlement
                     .ensure_resolved(instrument_id, "fill reports"),
             },
-            self.generate_fill_reports_impl(cmd),
+            Box::pin(self.generate_fill_reports_impl(cmd)),
         )
         .await
     }
@@ -561,9 +599,17 @@ async fn gate_report<T>(
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use nautilus_common::{cache::Cache, config::ConfigError};
+    use nautilus_model::{
+        enums::{AccountType, OmsType},
+        identifiers::{TraderId, Venue},
+    };
     use rstest::rstest;
 
     use super::*;
+    use crate::config::PolymarketInstrumentProviderConfig;
 
     #[rstest]
     #[tokio::test]
@@ -630,16 +676,6 @@ mod tests {
 
     #[rstest]
     fn test_execution_client_rejects_duplicate_config_before_setup() {
-        use std::{cell::RefCell, rc::Rc};
-
-        use nautilus_common::{cache::Cache, config::ConfigError};
-        use nautilus_model::{
-            enums::{AccountType, OmsType},
-            identifiers::{TraderId, Venue},
-        };
-
-        use crate::config::PolymarketInstrumentProviderConfig;
-
         let core = ExecutionClientCore::new(
             TraderId::from("TESTER-001"),
             ClientId::from("POLYMARKET"),

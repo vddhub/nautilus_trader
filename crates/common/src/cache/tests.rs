@@ -25,7 +25,8 @@ use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::defi::WEI_PRECISION;
 #[cfg(feature = "defi")]
 use nautilus_model::defi::{
-    AmmType, Dex, DexType, Pool, PoolIdentifier, PoolProfiler, Token, chain::chains,
+    AmmType, Blockchain, Chain, Dex, DexType, Pool, PoolIdentifier, PoolProfiler, Token,
+    chain::chains, currency::TokenCurrency,
 };
 use nautilus_model::{
     accounts::AccountAny,
@@ -564,6 +565,9 @@ fn test_cache_api_empty_read_surface_returns_empty(cache: Cache) {
     assert_eq!(api.quote_at_index(&instrument_id, 0), None);
     assert_eq!(api.trade_at_index(&instrument_id, 0), None);
     assert_eq!(api.bar_at_index(&bar_type, 0), None);
+    assert_eq!(api.mark_price_at_index(&instrument_id, 0), None);
+    assert_eq!(api.index_price_at_index(&instrument_id, 0), None);
+    assert_eq!(api.funding_rate_at_index(&instrument_id, 0), None);
     assert_eq!(api.mark_price_count(&instrument_id), 0);
     assert_eq!(api.index_price_count(&instrument_id), 0);
     assert_eq!(api.funding_rate_count(&instrument_id), 0);
@@ -1646,7 +1650,222 @@ fn test_try_get_xrate_path_overflow_returns_error(#[case] price_type: PriceType)
 
     assert_eq!(
         result.unwrap_err().to_string(),
-        "Decimal overflow multiplying exchange rates for EUR/JPY at AUD/JPY"
+        "No representable exchange rate from EUR to JPY"
+    );
+}
+
+#[rstest]
+#[case(PriceType::Bid)]
+#[case(PriceType::Ask)]
+#[case(PriceType::Mid)]
+fn test_try_get_xrate_path_overflow_uses_alternate_route(#[case] price_type: PriceType) {
+    let mut cache = Cache::default();
+    let venue = Venue::from("SIM");
+    for (symbol, rate) in [
+        ("EUR/USD", "1000000000"),
+        ("USD/GBP", "1000000000"),
+        ("GBP/AUD", "1000000000"),
+        ("AUD/JPY", "1000000000"),
+        ("EUR/ZAR", "2"),
+        ("ZAR/JPY", "3"),
+    ] {
+        let instrument = default_fx_ccy(Symbol::from(symbol), Some(venue));
+        let instrument_id = instrument.id;
+        cache
+            .add_instrument(InstrumentAny::CurrencyPair(instrument))
+            .unwrap();
+        cache
+            .add_quote(QuoteTick::new(
+                instrument_id,
+                Price::from(rate),
+                Price::from(rate),
+                Quantity::from("1"),
+                Quantity::from("2"),
+                UnixNanos::from(1),
+                UnixNanos::from(2),
+            ))
+            .unwrap();
+    }
+
+    let result = cache.try_get_xrate(venue, Currency::EUR(), Currency::JPY(), price_type);
+
+    assert_eq!(result.unwrap(), Some(dec!(6)));
+}
+
+#[rstest]
+#[case(PriceType::Bid, "1", "5")]
+#[case(PriceType::Ask, "1", "5")]
+#[case(PriceType::Mid, "1", "5")]
+#[case(PriceType::Bid, "2000000000", "1")]
+#[case(PriceType::Ask, "2000000000", "1")]
+#[case(PriceType::Mid, "2000000000", "1")]
+fn test_try_get_xrate_path_overflow_uses_alternate_quote(
+    #[case] price_type: PriceType,
+    #[case] alternate_rate: &str,
+    #[case] perpetual_rate: &str,
+) {
+    let mut cache = Cache::default();
+    let venue = Venue::from("SIM");
+    for (symbol, rate) in [
+        ("EUR/USD", "1000000000"),
+        ("USD/GBP", "1000000000"),
+        ("GBP/AUD", "1000000000"),
+        ("AUD/JPY", "1000000000"),
+    ] {
+        let mut instrument = default_fx_ccy(Symbol::from(symbol), Some(venue));
+        if symbol == "EUR/USD" {
+            instrument.id = InstrumentId::from("EUR/USD-0.SIM");
+        }
+
+        let instrument_id = instrument.id;
+        cache
+            .add_instrument(InstrumentAny::CurrencyPair(instrument))
+            .unwrap();
+        cache
+            .add_quote(QuoteTick::new(
+                instrument_id,
+                Price::from(rate),
+                Price::from(rate),
+                Quantity::from("1"),
+                Quantity::from("2"),
+                UnixNanos::from(1),
+                UnixNanos::from(2),
+            ))
+            .unwrap();
+    }
+
+    let mut alternate = default_fx_ccy(Symbol::from("EUR/USD"), Some(venue));
+    alternate.id = InstrumentId::from("EUR/USD-1.SIM");
+    let alternate_id = alternate.id;
+    cache
+        .add_instrument(InstrumentAny::CurrencyPair(alternate))
+        .unwrap();
+    cache
+        .add_quote(QuoteTick::new(
+            alternate_id,
+            Price::from(alternate_rate),
+            Price::from(alternate_rate),
+            Quantity::from("1"),
+            Quantity::from("2"),
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+        ))
+        .unwrap();
+
+    let mut perpetual = crypto_perpetual_ethusdt();
+    perpetual.id = InstrumentId::from("AUDJPY-PERP.SIM");
+    perpetual.base_currency = Currency::AUD();
+    perpetual.quote_currency = Currency::JPY();
+    let perpetual_id = perpetual.id;
+    cache
+        .add_instrument(InstrumentAny::CryptoPerpetual(perpetual))
+        .unwrap();
+    cache
+        .add_quote(QuoteTick::new(
+            perpetual_id,
+            Price::from(perpetual_rate),
+            Price::from(perpetual_rate),
+            Quantity::from("1"),
+            Quantity::from("2"),
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+        ))
+        .unwrap();
+
+    let result = cache.try_get_xrate(venue, Currency::EUR(), Currency::JPY(), price_type);
+
+    assert_eq!(result.unwrap(), Some(dec!(1000000000000000000000000000)));
+}
+
+#[rstest]
+#[case(PriceType::Bid)]
+#[case(PriceType::Ask)]
+#[case(PriceType::Mid)]
+fn test_try_get_xrate_path_overflow_uses_two_alternate_quotes(#[case] price_type: PriceType) {
+    let mut cache = Cache::default();
+    let venue = Venue::from("SIM");
+    for symbol in ["EUR/USD", "USD/GBP", "GBP/AUD", "AUD/ZAR", "ZAR/JPY"] {
+        let mut instrument = default_fx_ccy(Symbol::from(symbol), Some(venue));
+        if matches!(symbol, "EUR/USD" | "USD/GBP") {
+            instrument.id = InstrumentId::from(format!("{symbol}-0.SIM"));
+        }
+
+        let instrument_id = instrument.id;
+        cache
+            .add_instrument(InstrumentAny::CurrencyPair(instrument))
+            .unwrap();
+        cache
+            .add_quote(QuoteTick::new(
+                instrument_id,
+                Price::from("1000000000"),
+                Price::from("1000000000"),
+                Quantity::from("1"),
+                Quantity::from("2"),
+                UnixNanos::from(1),
+                UnixNanos::from(2),
+            ))
+            .unwrap();
+    }
+
+    for symbol in ["EUR/USD", "USD/GBP"] {
+        let mut instrument = default_fx_ccy(Symbol::from(symbol), Some(venue));
+        instrument.id = InstrumentId::from(format!("{symbol}-1.SIM"));
+        let instrument_id = instrument.id;
+        cache
+            .add_instrument(InstrumentAny::CurrencyPair(instrument))
+            .unwrap();
+        cache
+            .add_quote(QuoteTick::new(
+                instrument_id,
+                Price::from("1"),
+                Price::from("1"),
+                Quantity::from("1"),
+                Quantity::from("2"),
+                UnixNanos::from(1),
+                UnixNanos::from(2),
+            ))
+            .unwrap();
+    }
+
+    let result = cache.try_get_xrate(venue, Currency::EUR(), Currency::JPY(), price_type);
+
+    assert_eq!(result.unwrap(), Some(dec!(1000000000000000000000000000)));
+}
+
+#[rstest]
+#[case(PriceType::Last, "LAST")]
+#[case(PriceType::Mark, "MARK")]
+fn test_try_get_xrate_with_alternate_quote_rejects_price_type(
+    #[case] price_type: PriceType,
+    #[case] name: &str,
+) {
+    let mut cache = Cache::default();
+    let venue = Venue::from("SIM");
+    for (suffix, rate) in [("0", "2"), ("1", "3")] {
+        let mut instrument = default_fx_ccy(Symbol::from("EUR/USD"), Some(venue));
+        instrument.id = InstrumentId::from(format!("EUR/USD-{suffix}.SIM"));
+        let instrument_id = instrument.id;
+        cache
+            .add_instrument(InstrumentAny::CurrencyPair(instrument))
+            .unwrap();
+        cache
+            .add_quote(QuoteTick::new(
+                instrument_id,
+                Price::from(rate),
+                Price::from(rate),
+                Quantity::from("1"),
+                Quantity::from("2"),
+                UnixNanos::from(1),
+                UnixNanos::from(2),
+            ))
+            .unwrap();
+    }
+
+    let result = cache.try_get_xrate(venue, Currency::EUR(), Currency::USD(), price_type);
+
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        format!("Invalid `price_type`, was '{name}'")
     );
 }
 
@@ -1896,7 +2115,7 @@ fn test_get_xrate_builds_quote_keys_from_instrument_currencies(
     add_quote(&mut cache, aapl.id, "200.00", "201.00");
 
     let venue = Venue::from("BINANCE");
-    let (bid_quotes, ask_quotes) = cache.build_quote_table(&venue);
+    let (bid_quotes, ask_quotes, _) = cache.build_quote_table(&venue);
 
     assert_eq!(
         bid_quotes,
@@ -7201,6 +7420,48 @@ fn test_add_funding_rates_indexes_each_instrument() {
             .collect::<Vec<_>>(),
         vec![(2, 2)]
     );
+}
+
+#[rstest]
+fn test_price_updates_at_index_most_recent_first(mut cache: Cache) {
+    let instrument_id = InstrumentId::from("AUDUSD.SIM");
+
+    for ts_event in 0..2 {
+        cache
+            .add_mark_price(mark_price_with_ts(instrument_id, ts_event))
+            .unwrap();
+        cache
+            .add_index_price(index_price_with_ts(instrument_id, ts_event))
+            .unwrap();
+        cache
+            .add_funding_rate(funding_rate_with_ts(instrument_id, ts_event))
+            .unwrap();
+    }
+
+    for (index, ts_event) in [(0, 1), (1, 0)] {
+        let ts_event = UnixNanos::from(ts_event);
+        assert_eq!(
+            cache
+                .mark_price_at_index(&instrument_id, index)
+                .map(|update| update.ts_event),
+            Some(ts_event)
+        );
+        assert_eq!(
+            cache
+                .index_price_at_index(&instrument_id, index)
+                .map(|update| update.ts_event),
+            Some(ts_event)
+        );
+        assert_eq!(
+            cache
+                .funding_rate_at_index(&instrument_id, index)
+                .map(|update| update.ts_event),
+            Some(ts_event)
+        );
+    }
+    assert_eq!(cache.mark_price_at_index(&instrument_id, 2), None);
+    assert_eq!(cache.index_price_at_index(&instrument_id, 2), None);
+    assert_eq!(cache.funding_rate_at_index(&instrument_id, 2), None);
 }
 
 #[rstest]
@@ -13643,6 +13904,10 @@ fn test_settle_position_snapshots_replaces_frames_and_keeps_durable_blobs(mut ca
     assert_eq!(cache.position_snapshot_count(&position_id), 1);
     assert_eq!(settled.len(), 1);
     assert_eq!(settled[0].realized_pnl, Some(Money::from("7.00 USD")));
+    // The settled frame holds none of the current cycle's fills but keeps the trades known
+    // under the ID.
+    assert!(settled[0].events.is_empty());
+    assert_eq!(settled[0].trade_ids, position.trade_ids);
     assert_eq!(cache.position_snapshot_count(&other_position.id), 1);
     // Durable blobs are untouched, matching `purge_position`, so an anchor still resolves
     assert_eq!(
@@ -15815,4 +16080,36 @@ fn test_cache_api_infallible_borrow_conflict_panics_with_context() {
     let api = CacheApi::new(&cell);
     let _guard = cell.borrow_mut();
     let _ = api.order(&ClientOrderId::from("BORROW-ORDER"));
+}
+
+#[cfg(feature = "defi")]
+#[rstest]
+fn test_token_currency_does_not_replace_cached_legacy_code() {
+    let token = Token::new(
+        Arc::new(Chain::new(Blockchain::Ethereum, 812_401)),
+        "0x3141592653589793238462643383279502884197"
+            .parse()
+            .unwrap(),
+        "Registered token".into(),
+        "CACHELEGACY".into(),
+        6,
+    );
+    let code = TokenCurrency::from(&token).code();
+    let legacy = Currency::new(code.as_str(), 6, 0, "Legacy currency", CurrencyType::Crypto);
+    let mut cache = Cache::default();
+    cache.add_currency(legacy).unwrap();
+    let currency = token.currency().unwrap();
+
+    let error = cache.add_currency(currency).unwrap_err();
+    let retained = cache.currency(&legacy.code).unwrap();
+
+    assert_eq!(
+        error.to_string(),
+        format!("Legacy currency occupies token code {code}")
+    );
+    assert_eq!(retained.code, legacy.code);
+    assert_eq!(retained.precision, 6);
+    assert_eq!(retained.iso4217, 0);
+    assert_eq!(retained.name, "Legacy currency");
+    assert_eq!(retained.currency_type, CurrencyType::Crypto);
 }

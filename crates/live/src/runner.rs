@@ -667,6 +667,18 @@ impl AsyncRunner {
             self.channels.data_cmd_rx.len(),
         );
 
+        let total =
+            pending.0 + pending.1 + pending.2 + pending.3 + pending.4 + pending.5 + pending.6;
+        log::debug!("Draining shutdown queues ({total} events initially pending)");
+        let mut progress = 0usize;
+        let mut process = |event| {
+            process(event);
+            progress += 1;
+            if progress.is_multiple_of(10_000) {
+                log::debug!("Processed {progress} events during shutdown drain");
+            }
+        };
+
         let mut processed = 0;
         processed += poll_channel(
             &mut self.channels.time_evt_rx,
@@ -710,6 +722,7 @@ impl AsyncRunner {
             PendingRunnerEvent::DataCommand,
             &mut process,
         );
+        log::debug!("Drained {processed} remaining events during shutdown");
         processed
     }
 
@@ -819,6 +832,8 @@ mod tests {
     use nautilus_core::time::get_atomic_clock_realtime;
     use nautilus_core::{UUID4, UnixNanos};
     use nautilus_execution::engine::ExecutionEngine;
+    #[cfg(feature = "node")]
+    use nautilus_model::types::Money;
     use nautilus_model::{
         data::{
             Data, DataType, FundingRateUpdate, InstrumentStatus, OptionGreeks, quote::QuoteTick,
@@ -830,7 +845,7 @@ mod tests {
             AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue,
         },
         instruments::{InstrumentAny, stubs::crypto_perpetual_ethusdt},
-        types::{Money, Price, Quantity},
+        types::{Price, Quantity},
     };
     use rstest::rstest;
     use ustr::Ustr;

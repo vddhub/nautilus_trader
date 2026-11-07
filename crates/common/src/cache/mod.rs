@@ -101,7 +101,7 @@ use rust_decimal::Decimal;
 use ustr::Ustr;
 pub use view::CacheView; // Re-export
 
-use crate::xrate::get_exchange_rate;
+use crate::xrate::{get_exchange_rate, get_exchange_rate_with_alternates};
 
 /// A common in-memory `Cache` for market and execution related data.
 #[cfg_attr(
@@ -433,6 +433,12 @@ impl Cache {
         self.external_data_clients.contains(client_id)
     }
 
+    /// Returns whether any external data clients are registered.
+    #[must_use]
+    pub fn has_external_data_clients(&self) -> bool {
+        !self.external_data_clients.is_empty()
+    }
+
     /// Registers `client_id` as an external data client.
     ///
     /// Registrations survive [`Self::clear_index`] and [`Self::reset`].
@@ -505,6 +511,9 @@ impl Cache {
         // An adapter registers the loaded currencies before decoding their dependents; repeating
         // it here keeps the cached map consistent with the registry whatever the adapter did.
         register_loaded_currencies(&mut cache_map.currencies)?;
+        #[cfg(feature = "defi")]
+        self.defi.restore_currencies(&cache_map.currencies);
+
         self.currencies = cache_map.currencies;
         self.instruments = cache_map.instruments;
         self.instrument_closes = cache_map.instrument_closes;
@@ -544,12 +553,16 @@ impl Cache {
     ///
     /// Returns an error if loading currencies cache fails.
     pub async fn cache_currencies(&mut self) -> anyhow::Result<()> {
-        self.currencies = match &mut self.database {
+        let mut currencies = match &mut self.database {
             Some(db) => db.load_currencies().await?,
             None => AHashMap::new(),
         };
 
-        register_loaded_currencies(&mut self.currencies)?;
+        register_loaded_currencies(&mut currencies)?;
+        #[cfg(feature = "defi")]
+        self.defi.restore_currencies(&currencies);
+
+        self.currencies = currencies;
 
         log::info!("Cached {} currencies from database", self.currencies.len());
         Ok(())
@@ -2150,8 +2163,8 @@ impl Cache {
     /// responsible for ensuring the instrument is no longer in use before purging.
     fn purge_instrument_inner(&mut self, instrument_id: InstrumentId, skip_order_guard: bool) {
         #[cfg(feature = "defi")]
-        let defi_found = self.defi.pools.contains_key(&instrument_id)
-            || self.defi.pool_profilers.contains_key(&instrument_id);
+        let defi_found =
+            self.pool(&instrument_id).is_some() || self.pool_profiler(&instrument_id).is_some();
         #[cfg(not(feature = "defi"))]
         let defi_found = false;
 
@@ -2209,10 +2222,7 @@ impl Cache {
             .retain(|bar_type, _| bar_type.instrument_id() != instrument_id);
 
         #[cfg(feature = "defi")]
-        {
-            self.defi.pools.remove(&instrument_id);
-            self.defi.pool_profilers.remove(&instrument_id);
-        }
+        self.defi.remove_instrument(&instrument_id);
 
         log::info!("Purged instrument {instrument_id}");
     }
@@ -2354,16 +2364,15 @@ impl Cache {
         self.yield_curves.clear();
 
         if self.config.drop_instruments_on_reset {
+            #[cfg(feature = "defi")]
+            self.defi.clear_currencies();
             self.currencies.clear();
             self.instruments.clear();
             self.synthetics.clear();
         }
 
         #[cfg(feature = "defi")]
-        {
-            self.defi.pools.clear();
-            self.defi.pool_profilers.clear();
-        }
+        self.defi.clear_pools();
 
         self.clear_index();
 
@@ -2839,6 +2848,21 @@ impl Cache {
     ///
     /// Returns an error if persisting the currency to the backing database fails.
     pub fn add_currency(&mut self, currency: Currency) -> anyhow::Result<()> {
+        #[cfg(feature = "defi")]
+        let token = nautilus_model::defi::currency::check(currency)?.is_some();
+        #[cfg(feature = "defi")]
+        if token {
+            if let Some(existing) = self.currencies.get(&currency.code) {
+                if !self.defi.contains_currency(&currency.code) {
+                    anyhow::bail!("Legacy currency occupies token code {}", currency.code);
+                }
+
+                nautilus_model::defi::currency::check(*existing)?;
+            }
+
+            Currency::register(currency, false)?;
+        }
+
         if self.currencies.contains_key(&currency.code) {
             return Ok(());
         }
@@ -2849,6 +2873,12 @@ impl Cache {
         }
 
         self.currencies.insert(currency.code, currency);
+
+        #[cfg(feature = "defi")]
+        if token {
+            self.defi.add_currency(currency.code);
+        }
+
         Ok(())
     }
 
@@ -2860,6 +2890,9 @@ impl Cache {
     pub fn add_instrument(&mut self, instrument: InstrumentAny) -> anyhow::Result<()> {
         log::debug!("Adding `Instrument` {}", instrument.id());
 
+        #[cfg(feature = "defi")]
+        let migration = self.check_instrument_migration(&instrument)?;
+
         // Ensure currencies exist in cache - safe to call repeatedly as add_currency is idempotent
         if let Some(base_currency) = instrument.base_currency() {
             self.add_currency(base_currency)?;
@@ -2868,6 +2901,14 @@ impl Cache {
         self.add_currency(instrument.settlement_currency())?;
 
         if let Some(database) = &mut self.database {
+            #[cfg(feature = "defi")]
+            if let Some(migration) = migration {
+                database.add_defi_instrument(&instrument, migration)?;
+            } else {
+                database.add_instrument(&instrument)?;
+            }
+
+            #[cfg(not(feature = "defi"))]
             database.add_instrument(&instrument)?;
         }
 
@@ -3156,9 +3197,9 @@ impl Cache {
 
         // Reuse the existing cell on replace so the canonical entry stays in place
         // rather than orphaning a stale cell.
-        let order_cell = if let Some(order_cell) = self.orders.get(&client_order_id) {
+        let order_cell = if let Some(order_cell) = old_order_cell {
             *order_cell.borrow_mut() = order;
-            order_cell.clone()
+            order_cell
         } else {
             let order_cell = SharedCell::new(order);
             self.orders.insert(client_order_id, order_cell.clone());
@@ -4054,10 +4095,7 @@ impl Cache {
             self.index.orders_closed.insert(client_order_id);
         }
 
-        // A cancel rejection resolves the outstanding cancel request
-        if matches!(order.last_event(), OrderEventAny::CancelRejected(_)) {
-            self.index.orders_pending_cancel.remove(&client_order_id);
-        }
+        self.refresh_order_pending_cancel(order);
 
         // Update emulation index
         if order.emulation_trigger().is_some() && !order.is_closed() {
@@ -4092,6 +4130,18 @@ impl Cache {
         }
 
         Ok(())
+    }
+
+    fn refresh_order_pending_cancel(&mut self, order: &OrderAny) {
+        if matches!(
+            order.last_event(),
+            OrderEventAny::CancelDenied(_) | OrderEventAny::CancelRejected(_)
+        ) && !order.has_pending_cancel_command()
+        {
+            self.index
+                .orders_pending_cancel
+                .remove(&order.client_order_id());
+        }
     }
 
     /// Updates the `order` as pending cancel locally.
@@ -6866,6 +6916,21 @@ impl Cache {
             .and_then(|mark_prices| mark_prices.front())
     }
 
+    /// Returns the mark price update at `index` for the `instrument_id`.
+    ///
+    /// Index 0 is the most recently added update; index 1 is the previous insertion.
+    /// Entries are not sorted by timestamp. Returns `None` when no update exists at the index.
+    #[must_use]
+    pub fn mark_price_at_index(
+        &self,
+        instrument_id: &InstrumentId,
+        index: usize,
+    ) -> Option<&MarkPriceUpdate> {
+        self.mark_prices
+            .get(instrument_id)
+            .and_then(|mark_prices| mark_prices.get(index))
+    }
+
     /// Returns the most recently added index price update for the `instrument_id`, or `None` if absent.
     #[must_use]
     pub fn index_price(&self, instrument_id: &InstrumentId) -> Option<&IndexPriceUpdate> {
@@ -6874,12 +6939,42 @@ impl Cache {
             .and_then(|index_prices| index_prices.front())
     }
 
+    /// Returns the index price update at `index` for the `instrument_id`.
+    ///
+    /// Index 0 is the most recently added update; index 1 is the previous insertion.
+    /// Entries are not sorted by timestamp. Returns `None` when no update exists at the index.
+    #[must_use]
+    pub fn index_price_at_index(
+        &self,
+        instrument_id: &InstrumentId,
+        index: usize,
+    ) -> Option<&IndexPriceUpdate> {
+        self.index_prices
+            .get(instrument_id)
+            .and_then(|index_prices| index_prices.get(index))
+    }
+
     /// Returns the most recently added funding rate update for the `instrument_id`, or `None` if absent.
     #[must_use]
     pub fn funding_rate(&self, instrument_id: &InstrumentId) -> Option<&FundingRateUpdate> {
         self.funding_rates
             .get(instrument_id)
             .and_then(|funding_rates| funding_rates.front())
+    }
+
+    /// Returns the funding rate update at `index` for the `instrument_id`.
+    ///
+    /// Index 0 is the most recently added update; index 1 is the previous insertion.
+    /// Entries are not sorted by timestamp. Returns `None` when no update exists at the index.
+    #[must_use]
+    pub fn funding_rate_at_index(
+        &self,
+        instrument_id: &InstrumentId,
+        index: usize,
+    ) -> Option<&FundingRateUpdate> {
+        self.funding_rates
+            .get(instrument_id)
+            .and_then(|funding_rates| funding_rates.get(index))
     }
 
     /// Returns the most recently added instrument status for the `instrument_id`, or `None` if absent.
@@ -7054,6 +7149,9 @@ impl Cache {
 
     /// Tries to calculate the exchange rate without logging calculation errors.
     ///
+    /// If preferred quotes cannot form a rate, tries alternate quote selections by replacement
+    /// count, then source preference. This can take exponential time in the number of alternates.
+    ///
     /// # Errors
     ///
     /// Returns an error if the cached quotes cannot form a valid exchange rate calculation.
@@ -7070,24 +7168,33 @@ impl Cache {
             return Ok(Some(Decimal::ONE));
         }
 
-        let (bid_quote, ask_quote) = self.build_quote_table(&venue);
+        let (bid_quote, ask_quote, alternates) = self.build_quote_table(&venue);
 
-        get_exchange_rate(
-            from_currency.code,
-            to_currency.code,
-            price_type,
-            bid_quote,
-            ask_quote,
-        )
+        if alternates.is_empty() {
+            get_exchange_rate(
+                from_currency.code,
+                to_currency.code,
+                price_type,
+                bid_quote,
+                ask_quote,
+            )
+        } else {
+            get_exchange_rate_with_alternates(
+                from_currency.code,
+                to_currency.code,
+                price_type,
+                &bid_quote,
+                &ask_quote,
+                &alternates,
+            )
+        }
     }
 
-    fn build_quote_table(
-        &self,
-        venue: &Venue,
-    ) -> (AHashMap<Ustr, Decimal>, AHashMap<Ustr, Decimal>) {
+    fn build_quote_table(&self, venue: &Venue) -> QuoteTable {
         let mut bid_quotes = AHashMap::new();
         let mut ask_quotes = AHashMap::new();
         let mut quote_sources = AHashMap::new();
+        let mut alternates = Vec::new();
         let mut bar_quotes = None;
         let mut pair_buffer = String::new();
 
@@ -7135,15 +7242,32 @@ impl Cache {
                 .get(&pair)
                 .is_some_and(|current| current >= &preference)
             {
+                alternates.push((
+                    preference,
+                    pair,
+                    bid_price.as_decimal(),
+                    ask_price.as_decimal(),
+                ));
                 continue;
             }
 
-            bid_quotes.insert(pair, bid_price.as_decimal());
-            ask_quotes.insert(pair, ask_price.as_decimal());
-            quote_sources.insert(pair, preference);
+            let previous = quote_sources.insert(pair, preference);
+            if let (Some(preference), Some(bid), Some(ask)) = (
+                previous,
+                bid_quotes.insert(pair, bid_price.as_decimal()),
+                ask_quotes.insert(pair, ask_price.as_decimal()),
+            ) {
+                alternates.push((preference, pair, bid, ask));
+            }
         }
 
-        (bid_quotes, ask_quotes)
+        alternates.sort_unstable_by_key(|entry| Reverse(entry.0));
+        let alternates = alternates
+            .into_iter()
+            .map(|(_, pair, bid, ask)| (pair, bid, ask))
+            .collect();
+
+        (bid_quotes, ask_quotes, alternates)
     }
 
     fn build_bar_quote_table(
@@ -7596,6 +7720,12 @@ impl Cache {
         log::debug!("Completed own books audit in {:?}", start.elapsed());
     }
 }
+
+type QuoteTable = (
+    AHashMap<Ustr, Decimal>,
+    AHashMap<Ustr, Decimal>,
+    Vec<(Ustr, Decimal, Decimal)>,
+);
 
 const POSITION_OMS_KEY_PREFIX: &str = "position_oms:";
 
