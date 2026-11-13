@@ -53,13 +53,13 @@ sequenceDiagram
   participant VEN as Exchange
 
   CP->>PB: py_add_exec_client_live(factory, config)
-  PB->>PB: build LiveExecutionClient (factory.create + kernel state)
+  PB->>PB: build LiveExecutionClient (factory.create and kernel state)
   PB->>CH: send ExecClientCommand::Add(client, reply_tx)
-  PB->>PB: await (future_into_py) OR py.detach(reply_rx.blocking_recv())  %% GIL released, waits
+  PB->>PB: await (future_into_py) OR py.detach(reply_rx.blocking_recv()) [GIL released, waits]
   CH->>EL: dequeued on loop thread
   EL->>EE: add_exec_client_live(client)
   EE->>EE: reject only if client_id already registered
-  EE->>EE: register_client + venue routing (first client on venue only; 2nd+ addressed by client_id)
+  EE->>EE: register_client and venue routing (first client on venue only, 2nd onward addressed by client_id)
   EE->>VEN: connect_client (private WS/REST)
   EE->>VEN: request mass status
   VEN-->>EE: orders/positions/balances

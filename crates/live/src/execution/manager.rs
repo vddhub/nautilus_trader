@@ -9126,9 +9126,7 @@ mod tests {
             let client_id = ClientId::from("TEST-CLIENT");
             let account_id = AccountId::from("TEST-001");
 
-            manager
-                .submission_retention
-                .insert(client_id, account_id);
+            manager.submission_retention.insert(client_id, account_id);
 
             assert!(manager.submission_retention.contains_key(&client_id));
 

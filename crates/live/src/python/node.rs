@@ -54,9 +54,8 @@ use nautilus_core::{
     UUID4,
     python::{to_pyruntime_err, to_pyvalue_err},
 };
-use nautilus_model::{
-    enums::OmsType,
-    identifiers::{ActorId, ClientId, ExecAlgorithmId, InstrumentId, StrategyId, TraderId},
+use nautilus_model::identifiers::{
+    ActorId, ClientId, ExecAlgorithmId, InstrumentId, StrategyId, TraderId,
 };
 use nautilus_portfolio::{config::PortfolioConfig, python::PyPortfolio};
 use nautilus_system::get_global_pyo3_registry;
@@ -88,7 +87,7 @@ use super::client::{PythonClientConfig, PythonClients, PythonDataFactory, Python
 pub use crate::node::NodeState;
 use crate::{
     builder::LiveNodeBuilder,
-    command::ExecClientCommand,
+    command::LifecycleCommand,
     config::{
         LiveDataEngineConfig, LiveExecutionEngineConfig, LiveNodeConfig, LiveRiskEngineConfig,
         PluginConfig,
@@ -108,7 +107,7 @@ use crate::{
 /// can still build a client and enqueue lifecycle commands while the node is running.
 /// All fields are single-thread (`Rc`); `PyLiveNode` is `unsendable`, so this never crosses threads.
 struct CapturedRunState {
-    lifecycle_tx: tokio::sync::mpsc::UnboundedSender<ExecClientCommand>,
+    lifecycle_tx: tokio::sync::mpsc::UnboundedSender<LifecycleCommand>,
     trader_id: TraderId,
     cache: Rc<RefCell<nautilus_common::cache::Cache>>,
     clock: Rc<RefCell<dyn nautilus_common::clock::Clock>>,
@@ -167,7 +166,7 @@ impl PyLiveNode {
     fn lifecycle_ctx(
         &self,
     ) -> PyResult<(
-        tokio::sync::mpsc::UnboundedSender<ExecClientCommand>,
+        tokio::sync::mpsc::UnboundedSender<LifecycleCommand>,
         TraderId,
         Rc<RefCell<nautilus_common::cache::Cache>>,
         Rc<RefCell<dyn nautilus_common::clock::Clock>>,
@@ -1405,87 +1404,9 @@ impl PyLiveNode {
 
         log::debug!("`add_strategy` with a constructed instance");
 
-        let strategy = strategy.clone().unbind();
-
-        let strategy_id = self
-            .node_mut()?
-            .kernel_mut()
-            .trader
-            .borrow_mut()
-            .prepare_python_strategy_instance(&strategy)
-            .map_err(to_pyruntime_err)?;
-
-        let (external_order_instrument_ids, oms_type) = Python::attach(
-            |py| -> anyhow::Result<(Option<Vec<InstrumentId>>, Option<OmsType>)> {
-                let bound = strategy.bind(py);
-                let config_obj = bound
-                    .getattr("config")
-                    .ok()
-                    .filter(|config| !config.is_none());
-
-                let mut py_strategy_ref = bound
-                    .extract::<PyRefMut<PyStrategy>>()
-                    .map_err(Into::<PyErr>::into)
-                    .map_err(|e| anyhow::anyhow!("Failed to extract PyStrategy: {e}"))?;
-
-                if let Some(config_obj) = config_obj.as_ref()
-                    && let Some(claims) =
-                        extract_external_order_instrument_ids_config_attr(config_obj)?
-                {
-                    py_strategy_ref.set_external_order_instrument_ids(Some(claims));
-                }
-
-                let claims = py_strategy_ref.external_order_instrument_ids();
-                let oms_type = config_obj
-                    .as_ref()
-                    .and_then(|cfg| cfg.getattr("oms_type").ok())
-                    .filter(|value| !value.is_none())
-                    .and_then(|value| value.extract::<OmsType>().ok());
-
-                Ok((claims, oms_type))
-            },
-        )
-        .map_err(to_pyruntime_err)?;
-
-        let external_order_instrument_ids =
-            external_order_instrument_ids.filter(|claims| !claims.is_empty());
-        if let Some(claims) = &external_order_instrument_ids {
-            self.node_mut()?
-                .register_external_order_claims(strategy_id, claims)
-                .map_err(to_pyruntime_err)?;
-        }
-
-        let commit_result = self
-            .node_mut()?
-            .kernel_mut()
-            .trader
-            .borrow_mut()
-            .commit_python_strategy_instance(&strategy);
-
-        if let Err(commit_error) = commit_result {
-            if let Some(instrument_ids) = external_order_instrument_ids.as_deref()
-                && let Err(rollback_error) = self
-                    .node_mut()?
-                    .rollback_external_order_claims(strategy_id, instrument_ids)
-            {
-                return Err(to_pyruntime_err(format!(
-                    "Failed to add strategy {strategy_id}: {commit_error}; failed to roll back external order claims: {rollback_error}"
-                )));
-            }
-
-            return Err(to_pyruntime_err(commit_error));
-        }
-
-        if let Some(oms_type) = oms_type {
-            self.node_mut()?
-                .kernel()
-                .exec_engine
-                .borrow_mut()
-                .register_oms_type(strategy_id, oms_type);
-        }
-
-        log::info!("Registered Python strategy {strategy_id}");
-        Ok(())
+        self.node_mut()?
+            .add_strategy_python(strategy.clone().unbind())
+            .map_err(to_pyruntime_err)
     }
 
     #[pyo3(name = "add_strategy_from_config")]
@@ -1653,11 +1574,7 @@ impl PyLiveNode {
     /// - A client for the same venue is already registered.
     /// - Sending the lifecycle command fails.
     #[pyo3(name = "py_add_exec_client_live", signature = (factory, config))]
-    fn py_add_exec_client_live(
-        &self,
-        factory: Py<PyAny>,
-        config: Py<PyAny>,
-    ) -> PyResult<()> {
+    fn py_add_exec_client_live(&self, factory: Py<PyAny>, config: Py<PyAny>) -> PyResult<()> {
         if !self.handle.is_running() {
             return Err(to_pyruntime_err(
                 "Node is not running; add clients to a running node",
@@ -1685,19 +1602,25 @@ impl PyLiveNode {
 
             // Create the client using the factory, mirroring the builder pattern
             let boxed_client = boxed_factory
-                .create(trader_id, &client_id.to_string(), &*boxed_config, node.kernel().cache().clone().into(), clock)
+                .create(
+                    trader_id,
+                    &client_id.to_string(),
+                    &*boxed_config,
+                    node.kernel().cache().clone().into(),
+                    clock,
+                )
                 .map_err(|e| to_pyruntime_err(format!("Failed to create execution client: {e}")))?;
 
             let client = LiveExecutionClient::new(boxed_client);
 
             // Get the lifecycle sender
-            let lifecycle_tx = node
-                .get_lifecycle_cmd_sender()
-                .ok_or_else(|| to_pyruntime_err("Failed to get lifecycle sender: node has not been run yet"))?;
+            let lifecycle_tx = node.get_lifecycle_cmd_sender().ok_or_else(|| {
+                to_pyruntime_err("Failed to get lifecycle sender: node has not been run yet")
+            })?;
 
             // Enqueue Add command and await reply
             Self::send_lifecycle_command_and_await(py, &lifecycle_tx, |reply_tx| {
-                ExecClientCommand::Add(Box::new(client), reply_tx)
+                LifecycleCommand::AddExecClient(Box::new(client), reply_tx)
             })
         })
     }
@@ -1725,12 +1648,12 @@ impl PyLiveNode {
             let node = self.node()?;
             let client_id = ClientId::new(client_id);
 
-            let lifecycle_tx = node
-                .get_lifecycle_cmd_sender()
-                .ok_or_else(|| to_pyruntime_err("Failed to get lifecycle sender: node has not been run yet"))?;
+            let lifecycle_tx = node.get_lifecycle_cmd_sender().ok_or_else(|| {
+                to_pyruntime_err("Failed to get lifecycle sender: node has not been run yet")
+            })?;
 
             Self::send_lifecycle_command_and_await(py, &lifecycle_tx, |reply_tx| {
-                ExecClientCommand::Remove(client_id, reply_tx)
+                LifecycleCommand::RemoveExecClient(client_id, reply_tx)
             })
         })
     }
@@ -1760,7 +1683,7 @@ impl PyLiveNode {
         let (_client_id, client) =
             Self::build_live_exec_client(py, &factory, &config, trader_id, &cache, clock)?;
         let reply_rx = Self::enqueue_lifecycle_command(&lifecycle_tx, |reply_tx| {
-            ExecClientCommand::Add(Box::new(client), reply_tx)
+            LifecycleCommand::AddExecClient(Box::new(client), reply_tx)
         })?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -1792,7 +1715,74 @@ impl PyLiveNode {
         let client_id = ClientId::new(client_id);
         let (lifecycle_tx, _trader_id, _cache, _clock) = self.lifecycle_ctx()?;
         let reply_rx = Self::enqueue_lifecycle_command(&lifecycle_tx, |reply_tx| {
-            ExecClientCommand::Remove(client_id, reply_tx)
+            LifecycleCommand::RemoveExecClient(client_id, reply_tx)
+        })?;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            reply_rx
+                .await
+                .map_err(|_| to_pyruntime_err("Event loop dropped reply channel"))?
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
+    /// Adds a strategy to a running node on a host asyncio loop (`run_async`).
+    ///
+    /// Returns an awaitable that resolves once the running node's event loop has registered the
+    /// strategy, or raises with the real failure (duplicate ID, claim conflict, or commit error).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node is not running or the registration fails on the event loop.
+    #[pyo3(name = "add_strategy_live_async")]
+    fn py_add_strategy_live_async<'py>(
+        &self,
+        py: Python<'py>,
+        strategy: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if !self.handle.is_running() {
+            return Err(to_pyruntime_err(
+                "Node is not running; add strategies to a running node",
+            ));
+        }
+
+        let strategy = strategy.clone().unbind();
+        let (lifecycle_tx, _trader_id, _cache, _clock) = self.lifecycle_ctx()?;
+        let reply_rx = Self::enqueue_lifecycle_command(&lifecycle_tx, |reply_tx| {
+            LifecycleCommand::AddStrategy(strategy, reply_tx)
+        })?;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            reply_rx
+                .await
+                .map_err(|_| to_pyruntime_err("Event loop dropped reply channel"))?
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
+    /// Removes a strategy from a running node on a host asyncio loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node is not running or the removal fails on the event loop.
+    #[pyo3(name = "remove_strategy_async")]
+    fn py_remove_strategy_async<'py>(
+        &self,
+        py: Python<'py>,
+        strategy_id: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if !self.handle.is_running() {
+            return Err(to_pyruntime_err(
+                "Node is not running; remove strategies from a running node",
+            ));
+        }
+
+        let strategy_id = StrategyId::new(strategy_id);
+        let (lifecycle_tx, _trader_id, _cache, _clock) = self.lifecycle_ctx()?;
+        let reply_rx = Self::enqueue_lifecycle_command(&lifecycle_tx, |reply_tx| {
+            LifecycleCommand::RemoveStrategy(strategy_id, reply_tx)
         })?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -2019,19 +2009,33 @@ impl PyLiveNode {
     ) -> PyResult<(ClientId, LiveExecutionClient)> {
         let registry = get_global_pyo3_registry();
         let boxed_config = registry.extract_config(py, config.clone_ref(py))?;
-        let factory_name = factory.getattr(py, "name")?.call0(py)?.extract::<String>(py)?;
+        let factory_name = factory
+            .getattr(py, "name")?
+            .call0(py)?
+            .extract::<String>(py)?;
         let client_id = ClientId::new(factory_name);
 
         let boxed_client = match registry.extract_exec_factory(py, factory.clone_ref(py)) {
             Ok(f) => f
-                .create(trader_id, &client_id.to_string(), &*boxed_config, cache.clone().into(), clock)
+                .create(
+                    trader_id,
+                    &client_id.to_string(),
+                    &*boxed_config,
+                    cache.clone().into(),
+                    clock,
+                )
                 .map_err(|e| to_pyruntime_err(format!("Failed to create execution client: {e}")))?,
             Err(_) => {
                 let f = registry.extract_sim_exec_factory(py, factory.clone_ref(py))?;
-                f.create(trader_id, &client_id.to_string(), &*boxed_config, cache.clone())
-                    .map_err(|e| {
-                        to_pyruntime_err(format!("Failed to create simulated execution client: {e}"))
-                    })?
+                f.create(
+                    trader_id,
+                    &client_id.to_string(),
+                    &*boxed_config,
+                    cache.clone(),
+                )
+                .map_err(|e| {
+                    to_pyruntime_err(format!("Failed to create simulated execution client: {e}"))
+                })?
             }
         };
 
@@ -2039,31 +2043,36 @@ impl PyLiveNode {
     }
 
     fn enqueue_lifecycle_command<F>(
-        sender: &tokio::sync::mpsc::UnboundedSender<ExecClientCommand>,
+        sender: &tokio::sync::mpsc::UnboundedSender<LifecycleCommand>,
         make_cmd: F,
     ) -> PyResult<tokio::sync::oneshot::Receiver<crate::command::LifecycleCommandResponse>>
     where
-        F: FnOnce(tokio::sync::oneshot::Sender<crate::command::LifecycleCommandResponse>) -> ExecClientCommand,
+        F: FnOnce(
+            tokio::sync::oneshot::Sender<crate::command::LifecycleCommandResponse>,
+        ) -> LifecycleCommand,
     {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        sender.send(make_cmd(reply_tx)).map_err(|e| {
-            to_pyruntime_err(format!("Failed to enqueue exec client command: {e}"))
-        })?;
+        sender
+            .send(make_cmd(reply_tx))
+            .map_err(|e| to_pyruntime_err(format!("Failed to enqueue exec client command: {e}")))?;
         Ok(reply_rx)
     }
 
     fn send_lifecycle_command_and_await<F>(
         py: Python<'_>,
-        sender: &tokio::sync::mpsc::UnboundedSender<ExecClientCommand>,
+        sender: &tokio::sync::mpsc::UnboundedSender<LifecycleCommand>,
         make_cmd: F,
     ) -> PyResult<()>
     where
-        F: FnOnce(tokio::sync::oneshot::Sender<crate::command::LifecycleCommandResponse>) -> ExecClientCommand,
+        F: FnOnce(
+            tokio::sync::oneshot::Sender<crate::command::LifecycleCommandResponse>,
+        ) -> LifecycleCommand,
     {
         let reply_rx = Self::enqueue_lifecycle_command(sender, make_cmd)?;
 
         let result = py.detach(|| {
-            reply_rx.blocking_recv()
+            reply_rx
+                .blocking_recv()
                 .map_err(|_| "Event loop dropped reply channel".to_string())
                 .and_then(|r| r)
         });
@@ -2408,7 +2417,7 @@ fn extract_bool_config_attr(config_obj: &Bound<'_, PyAny>, attr: &str) -> Option
         .and_then(|val| val.extract::<bool>().ok())
 }
 
-fn extract_external_order_instrument_ids_config_attr(
+pub(crate) fn extract_external_order_instrument_ids_config_attr(
     config_obj: &Bound<'_, PyAny>,
 ) -> anyhow::Result<Option<Vec<InstrumentId>>> {
     let Ok(claims) = config_obj.getattr("external_order_instrument_ids") else {
@@ -5843,6 +5852,97 @@ class NoConfigActorAlgorithm(ActorAlgorithm):
                 Some(strategy_id)
             );
         }
+    }
+
+    #[rstest]
+    fn test_remove_strategy_deregisters_and_clears_claims() {
+        Python::initialize();
+
+        let module_name = "test_live_node_remove_strategy_instance";
+        Python::attach(|py| install_claim_strategy_module(py, module_name));
+
+        let node = LiveNode::builder(TraderId::from("TESTER-001"), Environment::Sandbox)
+            .unwrap()
+            .with_reconciliation(false)
+            .with_delay_post_stop_secs(0)
+            .with_timeout_connection(1)
+            .build()
+            .map(PyLiveNode::new)
+            .unwrap();
+
+        let instrument_id = InstrumentId::from("AUDUSD.SIM");
+        let strategy_id = StrategyId::from("CLAIMS-002");
+
+        Python::attach(|py| {
+            let module = py.import(module_name).expect("test module should import");
+            let kwargs = PyDict::new(py);
+            kwargs
+                .set_item("strategy_id", strategy_id.to_string())
+                .unwrap();
+            kwargs
+                .set_item(
+                    "external_order_instrument_ids",
+                    vec![instrument_id.to_string()],
+                )
+                .unwrap();
+            let config = module
+                .getattr("ClaimsConfig")
+                .unwrap()
+                .call((), Some(&kwargs))
+                .unwrap();
+            let strategy = module
+                .getattr("ClaimsStrategy")
+                .unwrap()
+                .call1((config,))
+                .unwrap();
+
+            node.py_add_strategy(&strategy)
+                .expect("strategy should register");
+        });
+
+        node.node_mut()
+            .unwrap()
+            .remove_strategy(strategy_id)
+            .expect("strategy should be removed");
+
+        let guard = node.node_mut().unwrap();
+        assert!(
+            !guard
+                .kernel()
+                .trader
+                .borrow()
+                .strategy_ids()
+                .contains(&strategy_id),
+            "strategy should be deregistered from the trader"
+        );
+        assert_eq!(
+            guard
+                .kernel()
+                .exec_engine
+                .borrow()
+                .get_external_order_claim(&instrument_id),
+            None,
+            "external order claim should be cleared on removal"
+        );
+    }
+
+    #[rstest]
+    fn test_remove_strategy_unknown_id_errors() {
+        Python::initialize();
+
+        let mut node = LiveNode::builder(TraderId::from("TESTER-001"), Environment::Sandbox)
+            .unwrap()
+            .with_reconciliation(false)
+            .with_delay_post_stop_secs(0)
+            .with_timeout_connection(1)
+            .build()
+            .unwrap();
+
+        let result = node.remove_strategy(StrategyId::from("NOPE-000"));
+        assert!(
+            result.is_err(),
+            "removing an unregistered strategy should error"
+        );
     }
 
     #[rstest]

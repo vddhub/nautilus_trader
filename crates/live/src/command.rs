@@ -18,25 +18,60 @@
 use std::fmt::Debug;
 
 use nautilus_model::identifiers::ClientId;
+#[cfg(feature = "python")]
+use nautilus_model::identifiers::StrategyId;
+#[cfg(feature = "python")]
+use pyo3::{Py, PyAny};
 
 use crate::execution::client::LiveExecutionClient;
 
 /// Response type for lifecycle commands: `Ok(())` or error message.
 pub type LifecycleCommandResponse = Result<(), String>;
 
-/// Commands for execution client lifecycle management routed through the live node's event loop.
-pub enum ExecClientCommand {
+/// Commands for component lifecycle management routed through the live node's event loop.
+///
+/// Each variant carries a oneshot reply sender so the caller receives the real success or
+/// failure once the loop thread has processed the command.
+pub enum LifecycleCommand {
     /// Add a new execution client to the running node.
-    Add(Box<LiveExecutionClient>, tokio::sync::oneshot::Sender<LifecycleCommandResponse>),
+    AddExecClient(
+        Box<LiveExecutionClient>,
+        tokio::sync::oneshot::Sender<LifecycleCommandResponse>,
+    ),
     /// Remove an execution client by its ID.
-    Remove(ClientId, tokio::sync::oneshot::Sender<LifecycleCommandResponse>),
+    RemoveExecClient(
+        ClientId,
+        tokio::sync::oneshot::Sender<LifecycleCommandResponse>,
+    ),
+    /// Add a Python strategy to the running node.
+    ///
+    /// The raw Python instance is registered on the loop thread, where the trader lives.
+    #[cfg(feature = "python")]
+    AddStrategy(
+        Py<PyAny>,
+        tokio::sync::oneshot::Sender<LifecycleCommandResponse>,
+    ),
+    /// Remove a strategy by its ID.
+    #[cfg(feature = "python")]
+    RemoveStrategy(
+        StrategyId,
+        tokio::sync::oneshot::Sender<LifecycleCommandResponse>,
+    ),
 }
 
-impl Debug for ExecClientCommand {
+impl Debug for LifecycleCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Add(client, _) => f.debug_tuple("Add").field(client).finish(),
-            Self::Remove(client_id, _) => f.debug_tuple("Remove").field(client_id).finish(),
+            Self::AddExecClient(client, _) => f.debug_tuple("AddExecClient").field(client).finish(),
+            Self::RemoveExecClient(client_id, _) => {
+                f.debug_tuple("RemoveExecClient").field(client_id).finish()
+            }
+            #[cfg(feature = "python")]
+            Self::AddStrategy(_, _) => f.debug_tuple("AddStrategy").finish(),
+            #[cfg(feature = "python")]
+            Self::RemoveStrategy(strategy_id, _) => {
+                f.debug_tuple("RemoveStrategy").field(strategy_id).finish()
+            }
         }
     }
 }

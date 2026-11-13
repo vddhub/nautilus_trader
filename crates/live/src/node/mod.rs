@@ -113,6 +113,8 @@ use nautilus_core::{
     datetime::{mins_to_secs, secs_to_nanos_unchecked},
 };
 use nautilus_execution::client::ExecutionClientAdapter;
+#[cfg(feature = "python")]
+use nautilus_model::enums::OmsType;
 #[cfg(test)]
 use nautilus_model::reports::OrderStatusReport;
 use nautilus_model::{
@@ -124,12 +126,18 @@ use nautilus_network::mode::ReconnectRequestOutcome;
 #[cfg(feature = "python")]
 use nautilus_system::trader::Trader;
 use nautilus_system::{config::NautilusKernelConfig, kernel::NautilusKernel};
+#[cfg(feature = "python")]
+use nautilus_trading::python::strategy::PyStrategy;
 use nautilus_trading::{
     ExecutionAlgorithm, ExecutionAlgorithmNative,
     strategy::{Strategy, StrategyNative},
 };
+#[cfg(feature = "python")]
+use pyo3::{Py, PyAny, PyErr, PyRefMut, Python, prelude::PyAnyMethods};
 use tabled::{builder::Builder, settings::Style};
 
+#[cfg(feature = "python")]
+use crate::python::node::extract_external_order_instrument_ids_config_attr;
 use crate::{
     dispatch::drain_callbacks,
     execution::{
@@ -207,7 +215,7 @@ pub struct LiveNode {
     external_msgbus: Option<ExternalMessageBusIngress>,
     stream_processors: Vec<StreamProcessor>,
     shutdown_deadline: Option<dst::time::Instant>,
-    lifecycle_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::command::ExecClientCommand>>,
+    lifecycle_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::command::LifecycleCommand>>,
     #[cfg(feature = "plugin")]
     plugins: plugin::NodePlugins,
     _thread_owner: Rc<()>,
@@ -407,7 +415,9 @@ impl LiveNode {
     ///
     /// This sender is populated during node startup. Returns `None` if the node has not been run yet.
     #[must_use]
-    pub fn get_lifecycle_cmd_sender(&self) -> Option<tokio::sync::mpsc::UnboundedSender<crate::command::ExecClientCommand>> {
+    pub fn get_lifecycle_cmd_sender(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<crate::command::LifecycleCommand>> {
         self.lifecycle_cmd_tx.clone()
     }
 
@@ -699,8 +709,7 @@ impl LiveNode {
 
         // Add to exec_clients and start report tasks (mirror build pattern)
         self.exec_clients.push(client.clone());
-        self.exec_manager
-            .register_submission_retention(&client);
+        self.exec_manager.register_submission_retention(&client);
 
         // Connect the client
         {
@@ -714,7 +723,11 @@ impl LiveNode {
         }
 
         // Generate mass status and reconcile (only for this client)
-        let lookback_mins = self.config.exec_engine.reconciliation_lookback_mins.map(u64::from);
+        let lookback_mins = self
+            .config
+            .exec_engine
+            .reconciliation_lookback_mins
+            .map(u64::from);
         let remaining = self.config.timeout_connection;
 
         let mass_status_result = dst::time::timeout(remaining, async {
@@ -726,9 +739,7 @@ impl LiveNode {
         })
         .await
         .map_err(|_| {
-            anyhow::anyhow!(
-                "Timeout reached while requesting mass status from {client_id}"
-            )
+            anyhow::anyhow!("Timeout reached while requesting mass status from {client_id}")
         })?;
 
         match mass_status_result {
@@ -823,7 +834,11 @@ impl LiveNode {
         }
 
         // Find and disconnect the LiveExecutionClient
-        if let Some(pos) = self.exec_clients.iter().position(|c| c.client_id() == client_id) {
+        if let Some(pos) = self
+            .exec_clients
+            .iter()
+            .position(|c| c.client_id() == client_id)
+        {
             let client = &mut self.exec_clients[pos];
             if let Err(e) = client.disconnect().await {
                 log::warn!("Error disconnecting client {client_id}: {e}");
@@ -840,7 +855,11 @@ impl LiveNode {
         }
 
         // Remove from exec_clients list
-        if let Some(pos) = self.exec_clients.iter().position(|c| c.client_id() == client_id) {
+        if let Some(pos) = self
+            .exec_clients
+            .iter()
+            .position(|c| c.client_id() == client_id)
+        {
             self.exec_clients.remove(pos);
         }
 
@@ -2143,15 +2162,27 @@ impl LiveNode {
                     }
 
                     // Process command and send result back through reply channel
-                    use crate::command::ExecClientCommand;
+                    use crate::command::LifecycleCommand;
                     match cmd {
-                        ExecClientCommand::Add(client, reply_tx) => {
+                        LifecycleCommand::AddExecClient(client, reply_tx) => {
                             let result = self.add_exec_client_live(*client).await
                                 .map_err(|e| e.to_string());
                             let _ = reply_tx.send(result);
                         }
-                        ExecClientCommand::Remove(client_id, reply_tx) => {
+                        LifecycleCommand::RemoveExecClient(client_id, reply_tx) => {
                             let result = self.remove_exec_client(client_id).await
+                                .map_err(|e| e.to_string());
+                            let _ = reply_tx.send(result);
+                        }
+                        #[cfg(feature = "python")]
+                        LifecycleCommand::AddStrategy(strategy, reply_tx) => {
+                            let result = self.add_strategy_python(strategy)
+                                .map_err(|e| e.to_string());
+                            let _ = reply_tx.send(result);
+                        }
+                        #[cfg(feature = "python")]
+                        LifecycleCommand::RemoveStrategy(strategy_id, reply_tx) => {
+                            let result = self.remove_strategy(strategy_id)
                                 .map_err(|e| e.to_string());
                             let _ = reply_tx.send(result);
                         }
@@ -3303,6 +3334,109 @@ impl LiveNode {
         }
 
         Ok(())
+    }
+
+    /// Registers a Python strategy instance on the trader.
+    ///
+    /// Unlike [`add_strategy`](Self::add_strategy), this does not reject a running node, so it can
+    /// be driven from the event loop to add a strategy to a live node. It mirrors the native path:
+    /// prepare the instance, register any external order claims, commit, and register an OMS type
+    /// override. A failed commit rolls back the external order claims.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strategy ID is already registered, the configured external order
+    /// claims conflict, or the commit fails.
+    #[cfg(feature = "python")]
+    pub fn add_strategy_python(&mut self, strategy: Py<PyAny>) -> anyhow::Result<()> {
+        let strategy_id = self
+            .kernel
+            .trader
+            .borrow_mut()
+            .prepare_python_strategy_instance(&strategy)?;
+
+        let (external_order_instrument_ids, oms_type) = Python::attach(
+            |py| -> anyhow::Result<(Option<Vec<InstrumentId>>, Option<OmsType>)> {
+                let bound = strategy.bind(py);
+                let config_obj = bound
+                    .getattr("config")
+                    .ok()
+                    .filter(|config| !config.is_none());
+
+                let mut py_strategy_ref = bound
+                    .extract::<PyRefMut<PyStrategy>>()
+                    .map_err(Into::<PyErr>::into)
+                    .map_err(|e| anyhow::anyhow!("Failed to extract PyStrategy: {e}"))?;
+
+                if let Some(config_obj) = config_obj.as_ref()
+                    && let Some(claims) =
+                        extract_external_order_instrument_ids_config_attr(config_obj)?
+                {
+                    py_strategy_ref.set_external_order_instrument_ids(Some(claims));
+                }
+
+                let claims = py_strategy_ref.external_order_instrument_ids();
+                let oms_type = config_obj
+                    .as_ref()
+                    .and_then(|cfg| cfg.getattr("oms_type").ok())
+                    .filter(|value| !value.is_none())
+                    .and_then(|value| value.extract::<OmsType>().ok());
+
+                Ok((claims, oms_type))
+            },
+        )?;
+
+        let external_order_instrument_ids =
+            external_order_instrument_ids.filter(|claims| !claims.is_empty());
+        if let Some(claims) = &external_order_instrument_ids {
+            self.register_external_order_claims(strategy_id, claims)?;
+        }
+
+        if let Err(commit_error) = self
+            .kernel
+            .trader
+            .borrow_mut()
+            .commit_python_strategy_instance(&strategy)
+        {
+            if let Some(instrument_ids) = external_order_instrument_ids.as_deref()
+                && let Err(rollback_error) =
+                    self.rollback_external_order_claims(strategy_id, instrument_ids)
+            {
+                anyhow::bail!(
+                    "Failed to add strategy {strategy_id}: {commit_error}; failed to roll back external order claims: {rollback_error}"
+                );
+            }
+
+            return Err(commit_error);
+        }
+
+        if let Some(oms_type) = oms_type {
+            self.kernel
+                .exec_engine
+                .borrow_mut()
+                .register_oms_type(strategy_id, oms_type);
+        }
+
+        log::info!("Registered Python strategy {strategy_id}");
+        Ok(())
+    }
+
+    /// Removes the strategy with the given `strategy_id` from the trader.
+    ///
+    /// Stops and disposes the strategy and clears its external order claims and subscriptions.
+    /// Open orders and positions are left in the cache as-is, mirroring
+    /// [`remove_exec_client`](Self::remove_exec_client). Can be driven from the event loop to
+    /// remove a strategy from a live node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strategy is not registered or disposal fails.
+    #[cfg(feature = "python")]
+    pub fn remove_strategy(&mut self, strategy_id: StrategyId) -> anyhow::Result<()> {
+        self.kernel
+            .trader
+            .borrow_mut()
+            .remove_strategy(&strategy_id)
     }
 
     /// Registers external order claims in the shared cache.

@@ -211,8 +211,43 @@ NOTE: the design's original "remove venue fallbacks entirely" was reverted — i
 single-account tests and the fallback is fail-closed/safe; isolation is achieved by the guard
 lift + explicit-id preference instead.
 
+## UPDATE 6 — runtime add/remove STRATEGY SHIPPED (2026-11-09)
+
+Strategies (bots) can now be added/removed on a LIVE node during a hosted `run_async`, not just
+pre-run — the zero-disruption `add_bot` path (option #3). Reuses the exec-client lifecycle plumbing;
+no new architecture.
+
+- Command channel `ExecClientCommand` renamed `LifecycleCommand` (via `gitnexus rename`); variants
+  `Add`/`Remove` → `AddExecClient`/`RemoveExecClient`; new python-gated `AddStrategy(Py<PyAny>)` /
+  `RemoveStrategy(StrategyId)`.
+- New `LiveNode::add_strategy_python` / `remove_strategy` run on the loop thread (where the trader
+  lives) — the command carries the raw Python instance since the trader isn't captured in
+  `CapturedRunState`. `py_add_strategy` (Idle path) now delegates to `add_strategy_python` (no dup).
+- Python async bindings `LiveNode.add_strategy_live_async` / `remove_strategy_async` mirror the
+  exec-client ones (`future_into_py`, no threads, no deadlock, usable during a run).
+- `remove_strategy` stops+disposes the strategy and clears its external order claims + subscriptions;
+  open orders/positions are left in cache as-is (mirrors `remove_exec_client`).
+- All in `crates/live` (command.rs, node/mod.rs, python/node.rs); impact LOW (gitnexus: 4 test
+  callers on `py_add_strategy`, 0 execution flows).
+
+Verified:
+- `cargo check` clean (warnings denied); live lib strategy tests 18 green incl. 2 new
+  (`test_remove_strategy_deregisters_and_clears_claims`, `test_remove_strategy_unknown_id_errors`);
+  exec-client integration 5 green (rename clean).
+- Branch wheel rebuilt (`maturin develop`); in-process demo (`poc/control_plane_demo.py`) now adds
+  AND removes a strategy mid-run against the Sandbox node:
+  ```
+  >> add_strategy_live_async(DEMO-STRAT-001) ...  OK — strategy registered mid-run
+  >> remove_strategy_async(DEMO-STRAT-001) ...    OK — strategy removed
+  ```
+- 2 pre-existing `test_lifecycle_command_*` integration tests time out in this sandbox (full
+  `run_async` teardown) — proven unrelated (fail identically with these changes stashed).
+
+Design: `docs/superpowers/specs/2026-11-09-runtime-add-strategy-design.md`. Uncommitted working tree.
+
 ### What's DONE
 - Runtime add/remove exec clients on a live node (Rust + Python async binding).
+- Runtime add/remove strategies (bots) on a live node during a run (Rust + Python async binding).
 - Per-account isolation (2+ accounts/venue), in-node pre-trade enforcement + reporting.
 
 ### What's LEFT for production

@@ -211,7 +211,7 @@ pub struct AsyncRunnerChannels {
     pub exec_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<TradingCommandMessage>>,
     pub data_evt_rx: tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<DataEvent>>,
     pub data_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<DataCommand>>,
-    pub lifecycle_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<crate::command::ExecClientCommand>,
+    pub lifecycle_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<crate::command::LifecycleCommand>,
 }
 
 #[cfg(feature = "node")]
@@ -242,7 +242,7 @@ pub struct AsyncRunner {
     exec_cmd_tx: tokio::sync::mpsc::UnboundedSender<DispatchMessage<TradingCommandMessage>>,
     data_evt_tx: tokio::sync::mpsc::UnboundedSender<DispatchMessage<DataEvent>>,
     data_cmd_tx: tokio::sync::mpsc::UnboundedSender<DispatchMessage<DataCommand>>,
-    lifecycle_cmd_tx: tokio::sync::mpsc::UnboundedSender<crate::command::ExecClientCommand>,
+    lifecycle_cmd_tx: tokio::sync::mpsc::UnboundedSender<crate::command::LifecycleCommand>,
 }
 
 /// Handle for stopping the `AsyncRunner` from another context.
@@ -291,7 +291,7 @@ impl AsyncRunner {
         let (exec_cmd_tx, exec_cmd_rx) = unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
         let (data_evt_tx, data_evt_rx) = unbounded_channel::<DispatchMessage<DataEvent>>();
         let (data_cmd_tx, data_cmd_rx) = unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (lifecycle_cmd_tx, lifecycle_cmd_rx) = unbounded_channel::<crate::command::ExecClientCommand>();
+        let (lifecycle_cmd_tx, lifecycle_cmd_rx) = unbounded_channel::<crate::command::LifecycleCommand>();
 
         Self {
             channels: AsyncRunnerChannels {
@@ -369,7 +369,9 @@ impl AsyncRunner {
 
     /// Returns a sender for lifecycle commands (execution client add/remove).
     #[must_use]
-    pub fn get_lifecycle_cmd_sender(&self) -> tokio::sync::mpsc::UnboundedSender<crate::command::ExecClientCommand> {
+    pub fn get_lifecycle_cmd_sender(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedSender<crate::command::LifecycleCommand> {
         self.lifecycle_cmd_tx.clone()
     }
 
